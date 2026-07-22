@@ -1,0 +1,60 @@
+{
+  "$comment": "Shared contract fixture for the registry wire shape (spec 2026-07-10-plugin-registry-api-design.md §8). Mirrored into motrix-turbo and the registry repo; all three consumers must parse this file unchanged. Entries are fictional.",
+  "version": 1,
+  "generatedAt": "2026-07-10T00:00:00.000Z",
+  "plugins": [
+    {
+      "id": "example.archive-unpacker",
+      "name": {
+        "en": "Example Archive Unpacker",
+        "zh": "示例压缩包解压器"
+      },
+      "description": {
+        "en": "Unpacks finished archive downloads into a folder next to the file.",
+        "zh": "下载完成后将压缩包解压到同级目录。"
+      },
+      "version": "2.1.0",
+      "author": {
+        "name": "Example Dev",
+        "url": "https://github.com/example/archive-unpacker"
+      },
+      "origin": "community",
+      "categories": ["post-action", "automation"],
+      "engines": { "motrix": ">=2.1.0 <3.0.0" },
+      "permissions": ["fs.task.write"],
+      "optionalPermissions": ["notifications"],
+      "hostPermissions": [],
+      "package": {
+        "url": "https://github.com/example/archive-unpacker/releases/download/v2.1.0/archive-unpacker-2.1.0.zip",
+        "sha256": "4f2d8c1a9b6e3705d4c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
+        "size": 48213
+      },
+      "repository": "https://github.com/example/archive-unpacker",
+      "homepage": "https://example.dev/archive-unpacker",
+      "icon": "https://dl.motrix.app/registry/assets/example.archive-unpacker/icon.png",
+      "screenshots": [
+        "https://dl.motrix.app/registry/assets/example.archive-unpacker/shot-1.png"
+      ],
+      "features": {
+        "en": [
+          "Unpacks zip, tar and 7z archives",
+          "Optional completion notification"
+        ],
+        "zh": ["支持 zip、tar、7z 压缩包", "可选的完成通知"]
+      },
+      "updatedAt": "2026-07-08",
+      "featured": true
+    },
+    {
+      "id": "example.minimal",
+      "name": { "en": "Example Minimal" },
+      "description": { "en": "The smallest entry the contract accepts." },
+      "version": "0.1.0",
+      "author": { "name": "Example Dev" },
+      "origin": "community",
+      "categories": ["integration"],
+      "engines": { "motrix": ">=2.0.0" },
+      "updatedAt": "2026-07-01"
+    }
+  ]
+}

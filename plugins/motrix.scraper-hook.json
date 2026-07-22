@@ -1,0 +1,34 @@
+{
+  "id": "motrix.scraper-hook",
+  "name": { "en": "Motrix Page Scraper", "zh": "Motrix 页面抓取" },
+  "description": {
+    "en": "Detects HTML download pages and rewrites the URL to the archive link they reference.",
+    "zh": "识别 HTML 下载页面并改写到页面里指向的压缩包链接。"
+  },
+  "version": "1.0.0",
+  "author": {
+    "name": "Motrix Team",
+    "url": "https://github.com/motrixapp"
+  },
+  "origin": "builtin",
+  "categories": ["site-resolver"],
+  "engines": { "motrix": ">=2.0.0 <3.0.0" },
+  "permissions": ["http"],
+  "hostPermissions": ["*://*/*"],
+  "repository": "https://github.com/motrixapp/builtin-plugins",
+  "features": {
+    "en": [
+      "Inspects a URL before the task is created",
+      "Detects when the target is an HTML landing page instead of a file",
+      "Rewrites the task to the first archive or installer link on the page (.zip, .tar.gz, .tgz, .rar, .7z, .exe, .dmg, .iso, .pkg)",
+      "Configurable page-scan size limit; direct file links are never touched"
+    ],
+    "zh": [
+      "在任务创建前检查 URL",
+      "识别目标是 HTML 落地页而非文件的情况",
+      "自动改写为页面中第一个压缩包或安装包直链（.zip、.tar.gz、.tgz、.rar、.7z、.exe、.dmg、.iso、.pkg）",
+      "可配置扫描页面体积上限；文件直链不受影响"
+    ]
+  },
+  "updatedAt": "2026-07-22"
+}

@@ -1,0 +1,35 @@
+{
+  "id": "motrix.url-resolver",
+  "name": { "en": "Motrix URL Resolver", "zh": "Motrix URL 解析器" },
+  "description": {
+    "en": "URL-resolver framework for Motrix. Ships no site-specific extractors; includes only a Wikimedia Commons demo resolver. Site resolution is provided by separately installed site-resolver plugins.",
+    "zh": "Motrix 的 URL 解析框架。不内置任何站点特定抽取器，仅含一个 Wikimedia Commons 演示解析器；站点解析由单独安装的 site-resolver 插件提供。"
+  },
+  "version": "1.0.0",
+  "author": {
+    "name": "Motrix Team",
+    "url": "https://github.com/motrixapp"
+  },
+  "origin": "builtin",
+  "categories": ["site-resolver"],
+  "engines": { "motrix": ">=2.0.0 <3.0.0" },
+  "permissions": ["http"],
+  "hostPermissions": ["*://commons.wikimedia.org/*"],
+  "repository": "https://github.com/motrixapp/builtin-plugins",
+  "features": {
+    "en": [
+      "Base framework for site-specific media resolver plugins",
+      "Includes a Wikimedia Commons demo resolver",
+      "Preferred quality setting (1080p, 720p or 480p) shared with installed site resolvers",
+      "Supports direct-URL and split video/audio (mux) resolver results"
+    ],
+    "zh": [
+      "站点媒体解析插件的基础框架",
+      "内置 Wikimedia Commons 演示解析器",
+      "首选清晰度设置（1080p / 720p / 480p），供已安装的 site-resolver 插件使用",
+      "支持直链与音视频分离（mux）两种解析结果"
+    ]
+  },
+  "updatedAt": "2026-07-22",
+  "featured": true
+}

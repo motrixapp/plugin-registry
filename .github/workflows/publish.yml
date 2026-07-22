@@ -1,0 +1,53 @@
+name: Publish
+
+# Aggregates plugins/ into dist/plugins.json and uploads it (plus assets/)
+# to the motrix-registry R2 bucket served by dl.motrix.app/registry/*.
+# Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm validate
+      - run: pnpm aggregate
+
+      - name: Upload plugins.json to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >
+          pnpm dlx wrangler r2 object put motrix-registry/plugins.json
+          --file dist/plugins.json
+          --content-type "application/json; charset=utf-8"
+          --remote
+
+      - name: Upload assets to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -d assets ]; then
+            find assets -type f | while read -r f; do
+              key="assets/${f#assets/}"
+              echo "uploading $key"
+              pnpm dlx wrangler r2 object put "motrix-registry/$key" --file "$f" --remote
+            done
+          else
+            echo "no assets directory; skipping"
+          fi

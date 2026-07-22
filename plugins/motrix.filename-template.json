@@ -1,0 +1,34 @@
+{
+  "id": "motrix.filename-template",
+  "name": { "en": "Motrix Filename Template", "zh": "Motrix 文件名模板" },
+  "description": {
+    "en": "Renames downloaded files using a template ({{title}}, {{ext}}, {{date}}, {{id}}) before they are finalized.",
+    "zh": "在完成下载前按模板（{{title}}、{{ext}}、{{date}}、{{id}}）重命名文件。"
+  },
+  "version": "1.0.1",
+  "author": {
+    "name": "Motrix Team",
+    "url": "https://github.com/motrixapp"
+  },
+  "origin": "builtin",
+  "categories": ["post-action"],
+  "engines": { "motrix": ">=2.0.0 <3.0.0" },
+  "permissions": ["fs.task.write"],
+  "hostPermissions": ["*://*/*"],
+  "repository": "https://github.com/motrixapp/builtin-plugins",
+  "features": {
+    "en": [
+      "Renames finished downloads from a configurable template",
+      "Placeholders: {{title}}, {{ext}}, {{date}}, {{id}}",
+      "Works with HTTP, FTP and BitTorrent downloads",
+      "Applies before the file is finalized on disk"
+    ],
+    "zh": [
+      "按可配置模板重命名已完成的下载",
+      "支持占位符：{{title}}、{{ext}}、{{date}}、{{id}}",
+      "支持 HTTP、FTP 与 BitTorrent 下载",
+      "在文件最终落盘前执行"
+    ]
+  },
+  "updatedAt": "2026-07-22"
+}
