@@ -2,7 +2,11 @@ name: Publish
 
 # Aggregates plugins/ into dist/plugins.json and uploads it (plus assets/)
 # to the motrix-registry R2 bucket served by dl.motrix.app/registry/*.
-# Requires repo secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+# Uploads use the S3-compatible API so the credentials can stay scoped to
+# this one bucket (Object Read & Write) — wrangler's REST path would need
+# an account-wide Admin token (cloudflare/workers-sdk#9235).
+# Requires repo secrets: R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+# CLOUDFLARE_ACCOUNT_ID.
 
 on:
   push:
@@ -30,25 +34,32 @@ jobs:
 
       - name: Upload plugins.json to R2
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          # R2 predates the aws CLI v2.23 default integrity checksums
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: >
-          pnpm dlx wrangler r2 object put motrix-registry/plugins.json
-          --file dist/plugins.json
+          aws s3api put-object
+          --endpoint-url "$R2_ENDPOINT"
+          --bucket motrix-registry
+          --key plugins.json
+          --body dist/plugins.json
           --content-type "application/json; charset=utf-8"
-          --remote
 
       - name: Upload assets to R2
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           if [ -d assets ]; then
-            find assets -type f | while read -r f; do
-              key="assets/${f#assets/}"
-              echo "uploading $key"
-              pnpm dlx wrangler r2 object put "motrix-registry/$key" --file "$f" --remote
-            done
+            aws s3 sync assets/ "s3://motrix-registry/assets/" --endpoint-url "$R2_ENDPOINT"
           else
             echo "no assets directory; skipping"
           fi
