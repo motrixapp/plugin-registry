@@ -8,7 +8,7 @@
     "en": "Renames downloaded files using a template ({{title}}, {{ext}}, {{date}}, {{id}}) before they are finalized.",
     "zh": "在完成下载前按模板（{{title}}、{{ext}}、{{date}}、{{id}}）重命名文件。"
   },
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": {
     "name": "Motrix Team",
     "url": "https://github.com/motrixapp"
@@ -43,9 +43,10 @@
   },
   "updatedAt": "2026-07-22",
   "package": {
-    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.filename-template%401.1.0/motrix.filename-template-1.1.0.moext",
-    "sha256": "6bdcf4e382c31f0e3d1c099b7db5c79355a74885168e7f84d99b6b2901dc01a9",
-    "size": 5659,
-    "signature": "V3jGTSEhWhkiLa9cLfCVwnA74ySodGUBqgCAgZ8xcYmcOOjexIfz/3Jq7J2SxD/mY8m3dUjl7H3NOqEjXjViBQ=="
-  }
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.filename-template%401.1.1/motrix.filename-template-1.1.1.moext",
+    "sha256": "3b88e4b79ae3a019f1efec08ccd69bf6f83088887f7c13205f1d58ea22bfc4da",
+    "size": 5673,
+    "signature": "6iz8Ay1qdVwRSuQRITBZCwNVBqHbSDJHZY8Ry5iTwuVmyrXR63NuQMHoOJddnYwLsx44S54QlhnMye3d7/jsDw=="
+  },
+  "optionalPermissions": []
 }
