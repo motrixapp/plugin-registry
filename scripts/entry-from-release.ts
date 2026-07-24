@@ -16,10 +16,44 @@ export interface ReleaseArtifacts {
   signatureB64: string
 }
 
+/**
+ * Consent-preview + compatibility fields the registry entry mirrors from the
+ * SIGNED manifest. The entry's `permissions` / `optionalPermissions` /
+ * `hostPermissions` are shown to users before install and `engines` gates
+ * whether an update is offered — but they used to be hand-authored, so they
+ * silently drifted from what the plugin actually requests (e.g.
+ * filename-template@1.1.0 dropped `hostPermissions` from its manifest while
+ * the entry kept advertising a broad wildcard host grant it no longer
+ * requested). Re-deriving them here on every regenerate makes that drift
+ * impossible.
+ */
+export interface ManifestMirror {
+  engines: { motrix: string }
+  permissions: string[]
+  optionalPermissions: string[]
+  hostPermissions: string[]
+}
+
 export interface PackageBlock {
   id: string
   version: string
   package: { url: string; sha256: string; size: number; signature: string }
+  mirror: ManifestMirror
+}
+
+/**
+ * Read a manifest field that must be a `string[]` when present. Absent
+ * optional fields (the manifest schema makes `optionalPermissions` /
+ * `hostPermissions` optional) become `[]` — the same value the wire schema's
+ * `.default([])` materializes for consumers, and an unconditional value so a
+ * stale entry field is always overwritten, never left to drift.
+ */
+function manifestStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) {
+    throw new Error(`signed manifest ${field} must be an array of strings`)
+  }
+  return value
 }
 
 const RELEASE_BASE = 'https://github.com/motrixapp/builtin-plugins/releases/download'
@@ -40,6 +74,11 @@ const TAG_RE = /^[^@]+@[^@]+$/
  * tag — mirroring the check `motrix-turbo`'s install path already performs
  * client-side, but here at publish time so a mislabeled entry never lands in
  * the registry at all.
+ *
+ * The same signed manifest is also the source for the entry's consent-preview
+ * (`permissions` / `optionalPermissions` / `hostPermissions`) and
+ * compatibility (`engines`) fields — see {@link ManifestMirror} — so the entry
+ * can never advertise something the plugin no longer requests.
  *
  * Any mismatch throws — nothing downstream writes an unverified package.
  */
@@ -105,7 +144,14 @@ export function buildPackageBlock(
       `motrix-plugin.json exceeds ${MANIFEST_SIZE_MAX} bytes (${manifestBytes.byteLength})`
     )
   }
-  let manifest: { id?: unknown; version?: unknown }
+  let manifest: {
+    id?: unknown
+    version?: unknown
+    engines?: { motrix?: unknown }
+    permissions?: unknown
+    optionalPermissions?: unknown
+    hostPermissions?: unknown
+  }
   try {
     manifest = JSON.parse(strFromU8(manifestBytes))
   } catch (err) {
@@ -119,6 +165,27 @@ export function buildPackageBlock(
     )
   }
 
+  // Mirror the consent-preview + compatibility fields off the SIGNED manifest.
+  // `engines.motrix` is required by both the manifest schema and the registry
+  // wire schema, so a manifest without it is corrupt — fail loudly rather than
+  // write an entry the registry would reject.
+  const motrixRange = manifest.engines?.motrix
+  if (typeof motrixRange !== 'string' || motrixRange.length === 0) {
+    throw new Error(`signed manifest for ${tag} has no engines.motrix range`)
+  }
+  const mirror: ManifestMirror = {
+    engines: { motrix: motrixRange },
+    permissions: manifestStringArray(manifest.permissions, 'permissions'),
+    optionalPermissions: manifestStringArray(
+      manifest.optionalPermissions,
+      'optionalPermissions'
+    ),
+    hostPermissions: manifestStringArray(
+      manifest.hostPermissions,
+      'hostPermissions'
+    ),
+  }
+
   return {
     id: tagId,
     version: a.metadata.version,
@@ -128,6 +195,7 @@ export function buildPackageBlock(
       size: a.metadata.size,
       signature: a.signatureB64,
     },
+    mirror,
   }
 }
 
@@ -147,6 +215,14 @@ export async function patchEntry(
   const entry = JSON.parse(await readFile(file, 'utf8'))
   entry.version = block.version
   entry.package = block.package
+  // Re-derive the consent-preview + compatibility fields from the signed
+  // manifest on every regenerate. These assignments are unconditional so a
+  // stale hand-authored value (the hostPermissions drift incident) can never
+  // survive — an absent manifest field lands here as [] via the mirror.
+  entry.engines = block.mirror.engines
+  entry.permissions = block.mirror.permissions
+  entry.optionalPermissions = block.mirror.optionalPermissions
+  entry.hostPermissions = block.mirror.hostPermissions
   const problems = validateEntry(`${id}.json`, entry).problems
   if (problems.length > 0) {
     throw new Error(

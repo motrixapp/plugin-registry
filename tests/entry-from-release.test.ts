@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { strToU8, zipSync } from 'fflate'
 import { afterEach, describe, expect, it } from 'vitest'
+import { RegistryPluginSchema } from '../schema/registry.ts'
 import {
   buildPackageBlock,
   patchEntry,
@@ -28,11 +29,17 @@ function sha256(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex')
 }
 
+// A faithful in-bundle manifest: the real signed manifest always carries
+// engines (required + strict in the manifest schema) plus the consent fields
+// the generator now mirrors into the entry.
 const URL_RESOLVER_MANIFEST = {
   manifestVersion: 1,
   id: 'motrix.url-resolver',
   version: '1.0.0',
   main: 'dist/plugin.js',
+  engines: { motrix: '>=2.0.0 <3.0.0' },
+  permissions: ['http'],
+  hostPermissions: ['*://commons.wikimedia.org/*'],
 }
 
 const moext = makeMoext(URL_RESOLVER_MANIFEST)
@@ -53,6 +60,34 @@ function artifacts(over: Partial<ReleaseArtifacts> = {}): ReleaseArtifacts {
   }
 }
 const TAG = 'motrix.url-resolver@1.0.0'
+
+/**
+ * Build signed ReleaseArtifacts + matching tag for an arbitrary in-bundle
+ * manifest, so a test can exercise how the generator mirrors the manifest's
+ * consent-preview / compatibility fields into the entry.
+ */
+function releaseFor(manifest: Record<string, unknown>): {
+  rel: ReleaseArtifacts
+  tag: string
+} {
+  const id = manifest.id as string
+  const version = manifest.version as string
+  const bytes = makeMoext(manifest)
+  return {
+    rel: {
+      moext: bytes,
+      metadata: {
+        id,
+        version,
+        file: `${id}-${version}.moext`,
+        sha256: sha256(bytes),
+        size: bytes.byteLength,
+      },
+      signatureB64: sign(null, bytes, privateKey).toString('base64'),
+    },
+    tag: `${id}@${version}`,
+  }
+}
 
 describe('buildPackageBlock', () => {
   it('returns a verified package block for a good release', () => {
@@ -138,6 +173,56 @@ describe('buildPackageBlock', () => {
   })
 })
 
+describe('buildPackageBlock mirrors the signed manifest consent+compat fields', () => {
+  it('carries permissions, optionalPermissions, hostPermissions and engines from the manifest', () => {
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id: 'motrix.url-resolver',
+      version: '1.0.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['http'],
+      optionalPermissions: ['notifications'],
+      hostPermissions: ['*://commons.wikimedia.org/*'],
+    })
+    const r = buildPackageBlock(rel, tag, PUB)
+    expect(r.mirror.engines).toEqual({ motrix: '>=2.0.0 <3.0.0' })
+    expect(r.mirror.permissions).toEqual(['http'])
+    expect(r.mirror.optionalPermissions).toEqual(['notifications'])
+    expect(r.mirror.hostPermissions).toEqual(['*://commons.wikimedia.org/*'])
+  })
+
+  // The incident shape: filename-template@1.1.0 dropped hostPermissions from
+  // its manifest entirely (they are optional in the manifest schema). The
+  // mirror must materialize the absent fields as [] so the entry advertises
+  // nothing the plugin no longer requests.
+  it('materializes absent optional consent fields as [] (manifest without hostPermissions)', () => {
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id: 'motrix.filename-template',
+      version: '1.1.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['fs.task.write'],
+    })
+    const r = buildPackageBlock(rel, tag, PUB)
+    expect(r.mirror.permissions).toEqual(['fs.task.write'])
+    expect(r.mirror.optionalPermissions).toEqual([])
+    expect(r.mirror.hostPermissions).toEqual([])
+  })
+
+  it('aborts when the signed manifest has no engines.motrix range', () => {
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id: 'motrix.url-resolver',
+      version: '1.0.0',
+      main: 'dist/plugin.js',
+      permissions: [],
+    })
+    expect(() => buildPackageBlock(rel, tag, PUB)).toThrow(/engines/i)
+  })
+})
+
 describe('patchEntry', () => {
   let dir: string
 
@@ -180,5 +265,114 @@ describe('patchEntry', () => {
   it('throws when the target id does not match the verified block identity', async () => {
     await writeFixture('motrix.url-resolver')
     await expect(patchEntry('motrix.other', block(), dir)).rejects.toThrow(/identity|id/i)
+  })
+})
+
+describe('patchEntry syncs consent+compat fields from the signed manifest', () => {
+  let dir: string
+
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * Write a builtin entry that already carries hand-authored consent/compat
+   * fields, so a patch can be shown to overwrite them from the manifest.
+   */
+  async function writeStaleEntry(
+    id: string,
+    stale: Record<string, unknown>
+  ): Promise<string> {
+    dir = await mkdtemp(path.join(tmpdir(), 'plugin-registry-test-'))
+    const entry = {
+      id,
+      name: { en: 'Filename Template' },
+      description: { en: 'Renames finished downloads.' },
+      version: '1.0.0',
+      author: { name: 'Motrix Team' },
+      origin: 'builtin',
+      categories: ['post-action'],
+      engines: { motrix: '>=1.0.0 <2.0.0' },
+      updatedAt: '2026-07-01',
+      ...stale,
+    }
+    await writeFile(path.join(dir, `${id}.json`), JSON.stringify(entry, null, 2))
+    return dir
+  }
+
+  it('overwrites a stale hostPermissions with the value from the manifest', async () => {
+    const id = 'motrix.filename-template'
+    await writeStaleEntry(id, { hostPermissions: ['*://*/*'] })
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id,
+      version: '1.1.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['fs.task.write'],
+      hostPermissions: ['*://commons.wikimedia.org/*'],
+    })
+    await patchEntry(id, buildPackageBlock(rel, tag, PUB), dir)
+    const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
+    expect(patched.hostPermissions).toEqual(['*://commons.wikimedia.org/*'])
+    expect(patched.permissions).toEqual(['fs.task.write'])
+  })
+
+  // THE incident case: 1.1.0 dropped hostPermissions from the manifest, yet the
+  // registry entry kept advertising ["*://*/*"] — the registry lied about what
+  // the plugin requests. The patch MUST clear the stale value to [] and the
+  // result must stay schema-valid.
+  it('clears a stale hostPermissions when the manifest requests none, and stays schema-valid', async () => {
+    const id = 'motrix.filename-template'
+    await writeStaleEntry(id, { hostPermissions: ['*://*/*'] })
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id,
+      version: '1.1.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['fs.task.write'],
+    })
+    await patchEntry(id, buildPackageBlock(rel, tag, PUB), dir)
+    const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
+    expect(patched.hostPermissions).toEqual([])
+    expect(patched.optionalPermissions).toEqual([])
+    expect(RegistryPluginSchema.safeParse(patched).success).toBe(true)
+  })
+
+  it('syncs the engines range from the manifest', async () => {
+    const id = 'motrix.filename-template'
+    await writeStaleEntry(id, { engines: { motrix: '>=1.0.0 <2.0.0' } })
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id,
+      version: '1.1.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['fs.task.write'],
+    })
+    await patchEntry(id, buildPackageBlock(rel, tag, PUB), dir)
+    const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
+    expect(patched.engines).toEqual({ motrix: '>=2.0.0 <3.0.0' })
+  })
+
+  it('leaves editorial fields (name, description, categories, updatedAt) untouched', async () => {
+    const id = 'motrix.filename-template'
+    await writeStaleEntry(id, { hostPermissions: ['*://*/*'] })
+    const before = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
+    const { rel, tag } = releaseFor({
+      manifestVersion: 1,
+      id,
+      version: '1.1.0',
+      main: 'dist/plugin.js',
+      engines: { motrix: '>=2.0.0 <3.0.0' },
+      permissions: ['fs.task.write'],
+    })
+    await patchEntry(id, buildPackageBlock(rel, tag, PUB), dir)
+    const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
+    expect(patched.name).toEqual(before.name)
+    expect(patched.description).toEqual(before.description)
+    expect(patched.categories).toEqual(before.categories)
+    expect(patched.updatedAt).toEqual(before.updatedAt)
   })
 })
