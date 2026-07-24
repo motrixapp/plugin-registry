@@ -106,4 +106,36 @@ describe('validateEntry policy', () => {
     })
     expect(ok.problems).toEqual([])
   })
+
+  it('requires a signature on a builtin package', () => {
+    const { problems } = validateEntry('motrix.demo.json', {
+      ...base,
+      id: 'motrix.demo',
+      origin: 'builtin',
+      package: {
+        url: 'https://github.com/motrixapp/builtin-plugins/releases/download/x/x.moext',
+        sha256: 'a'.repeat(64),
+        size: 10,
+      },
+    })
+    expect(
+      problems.some((p) => /builtin package.*signature|signature/.test(p.message))
+    ).toBe(true)
+  })
+
+  it('accepts a builtin package that carries a signature', () => {
+    const { problems } = validateEntry('motrix.demo.json', {
+      ...base,
+      id: 'motrix.demo',
+      origin: 'builtin',
+      categories: ['integration'],
+      package: {
+        url: 'https://github.com/motrixapp/builtin-plugins/releases/download/x/x.moext',
+        sha256: 'a'.repeat(64),
+        size: 10,
+        signature: 'c2ln',
+      },
+    })
+    expect(problems).toEqual([])
+  })
 })

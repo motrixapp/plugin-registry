@@ -63,6 +63,18 @@ export function validateEntry(
   }
 
   if (
+    entry.origin === 'builtin' &&
+    entry.package &&
+    !entry.package.signature
+  ) {
+    problems.push({
+      file,
+      message:
+        'a builtin package must carry an ed25519 signature (hot-update trust root)',
+    })
+  }
+
+  if (
     entry.package &&
     !PACKAGE_URL_ALLOWLIST.some((re) => re.test(entry.package?.url ?? ''))
   ) {
