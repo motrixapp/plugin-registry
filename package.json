@@ -7,6 +7,7 @@
   "scripts": {
     "validate": "tsx scripts/validate.ts",
     "aggregate": "tsx scripts/aggregate.ts",
+    "entry:from-release": "tsx scripts/entry-from-release.ts",
     "test": "vitest run",
     "check": "tsc --noEmit"
   },
