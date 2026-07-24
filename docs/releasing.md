@@ -12,10 +12,21 @@ logic; it is also used to populate entries manually (`pnpm entry:from-release`).
 
 ## One-time setup (repo admin)
 
-- **builtin-plugins secret `REGISTRY_DISPATCH_TOKEN`** — a fine-scoped PAT or
-  GitHub App token permitted to `POST repos/motrixapp/plugin-registry/dispatches`.
-  Until it is set, the release workflow's notify step is a no-op (a shell
-  guard skips it) and the release still succeeds.
+- **builtin-plugins → a GitHub App for the cross-repo dispatch.** Create an
+  org-owned GitHub App with the single Repository permission **Contents:
+  Read and write** (what `repository_dispatch` requires), install it on
+  `motrixapp/plugin-registry` only, and store its credentials in
+  builtin-plugins' **`plugin-signing` environment**:
+  - `REGISTRY_DISPATCH_APP_ID` — the App ID (secret or variable),
+  - `REGISTRY_DISPATCH_APP_PRIVATE_KEY` — the App private key `.pem` (secret).
+
+  The release workflow's `sign` job mints a short-lived (~1h), repo-scoped
+  installation token from these (`actions/create-github-app-token`) and uses
+  it to `POST repos/motrixapp/plugin-registry/dispatches`. This is a distinct
+  credential from the Ed25519 signing key (`MOTRIX_PLUGIN_SIGNING_KEY`) —
+  same environment, far lower sensitivity. Until BOTH App secrets are set,
+  the mint + notify steps skip (gated on a credentials-present check) and the
+  signed release still succeeds.
 - **plugin-registry setting** — Settings → Actions → General → "Allow GitHub
   Actions to create and approve pull requests" must be enabled so the
   workflow's `GITHUB_TOKEN` can open the PR.
