@@ -1,6 +1,9 @@
 {
   "id": "motrix.scraper-hook",
-  "name": { "en": "Motrix Page Scraper", "zh": "Motrix 页面抓取" },
+  "name": {
+    "en": "Motrix Page Scraper",
+    "zh": "Motrix 页面抓取"
+  },
   "description": {
     "en": "Detects HTML download pages and rewrites the URL to the archive link they reference.",
     "zh": "识别 HTML 下载页面并改写到页面里指向的压缩包链接。"
@@ -11,10 +14,18 @@
     "url": "https://github.com/motrixapp"
   },
   "origin": "builtin",
-  "categories": ["site-resolver"],
-  "engines": { "motrix": ">=2.0.0 <3.0.0" },
-  "permissions": ["http"],
-  "hostPermissions": ["*://*/*"],
+  "categories": [
+    "site-resolver"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [
+    "http"
+  ],
+  "hostPermissions": [
+    "*://*/*"
+  ],
   "repository": "https://github.com/motrixapp/builtin-plugins",
   "features": {
     "en": [
@@ -30,5 +41,11 @@
       "可配置扫描页面体积上限；文件直链不受影响"
     ]
   },
-  "updatedAt": "2026-07-22"
+  "updatedAt": "2026-07-22",
+  "package": {
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.scraper-hook%401.0.0/motrix.scraper-hook-1.0.0.moext",
+    "sha256": "2b6d1771fa0ccbd21e3a3da1284a589bd8f93d3a2ad6c6813fba6f21d2cfcb25",
+    "size": 2218,
+    "signature": "KjTE1YaLPLKLnsTuLS5aAoI8S7W1D5ziWis1QSvcG/khuimsOKzGeadkc1El0pNhyxWVLzXQR7MYfksUumYVCQ=="
+  }
 }

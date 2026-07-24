@@ -1,6 +1,9 @@
 {
   "id": "motrix.filename-template",
-  "name": { "en": "Motrix Filename Template", "zh": "Motrix 文件名模板" },
+  "name": {
+    "en": "Motrix Filename Template",
+    "zh": "Motrix 文件名模板"
+  },
   "description": {
     "en": "Renames downloaded files using a template ({{title}}, {{ext}}, {{date}}, {{id}}) before they are finalized.",
     "zh": "在完成下载前按模板（{{title}}、{{ext}}、{{date}}、{{id}}）重命名文件。"
@@ -11,10 +14,18 @@
     "url": "https://github.com/motrixapp"
   },
   "origin": "builtin",
-  "categories": ["post-action"],
-  "engines": { "motrix": ">=2.0.0 <3.0.0" },
-  "permissions": ["fs.task.write"],
-  "hostPermissions": ["*://*/*"],
+  "categories": [
+    "post-action"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [
+    "fs.task.write"
+  ],
+  "hostPermissions": [
+    "*://*/*"
+  ],
   "repository": "https://github.com/motrixapp/builtin-plugins",
   "features": {
     "en": [
@@ -30,5 +41,11 @@
       "在文件最终落盘前执行"
     ]
   },
-  "updatedAt": "2026-07-22"
+  "updatedAt": "2026-07-22",
+  "package": {
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.filename-template%401.0.1/motrix.filename-template-1.0.1.moext",
+    "sha256": "d7c2d105b7ab1b583c2df9f385556032e52c00d57fb884c15cf367edba88815d",
+    "size": 2085,
+    "signature": "2JlzcryE2mxSpospoXwfHVW9Jnb8aBRbbIYsYjDcmxM0JVyd84V8wqCaLKOFNwhg5N7kE9qLL8mf99ZY8HDODw=="
+  }
 }

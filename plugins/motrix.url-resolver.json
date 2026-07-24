@@ -1,6 +1,9 @@
 {
   "id": "motrix.url-resolver",
-  "name": { "en": "Motrix URL Resolver", "zh": "Motrix URL 解析器" },
+  "name": {
+    "en": "Motrix URL Resolver",
+    "zh": "Motrix URL 解析器"
+  },
   "description": {
     "en": "URL-resolver framework for Motrix. Ships no site-specific extractors; includes only a Wikimedia Commons demo resolver. Site resolution is provided by separately installed site-resolver plugins.",
     "zh": "Motrix 的 URL 解析框架。不内置任何站点特定抽取器，仅含一个 Wikimedia Commons 演示解析器；站点解析由单独安装的 site-resolver 插件提供。"
@@ -11,10 +14,18 @@
     "url": "https://github.com/motrixapp"
   },
   "origin": "builtin",
-  "categories": ["site-resolver"],
-  "engines": { "motrix": ">=2.0.0 <3.0.0" },
-  "permissions": ["http"],
-  "hostPermissions": ["*://commons.wikimedia.org/*"],
+  "categories": [
+    "site-resolver"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [
+    "http"
+  ],
+  "hostPermissions": [
+    "*://commons.wikimedia.org/*"
+  ],
   "repository": "https://github.com/motrixapp/builtin-plugins",
   "features": {
     "en": [
@@ -31,5 +42,11 @@
     ]
   },
   "updatedAt": "2026-07-22",
-  "featured": true
+  "featured": true,
+  "package": {
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.url-resolver%401.0.0/motrix.url-resolver-1.0.0.moext",
+    "sha256": "308dfd0ce86332f43aeb6ee84fad36a37d71f8fb7ef1eb1b79a0e6beb58e4a9e",
+    "size": 3161,
+    "signature": "0iUvgGLH7otX+1Or+ycq0xsIG1QWHIUrkFSRmvqGw+oWYTp8ALQvJSgNTC3qZ1lLK49uBrELd65roICetilpDg=="
+  }
 }
