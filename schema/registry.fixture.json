@@ -55,6 +55,25 @@
       "categories": ["integration"],
       "engines": { "motrix": ">=2.0.0" },
       "updatedAt": "2026-07-01"
+    },
+    {
+      "id": "motrix.url-resolver",
+      "name": { "en": "URL Resolver" },
+      "description": {
+        "en": "Resolves obfuscated download URLs before submission."
+      },
+      "version": "1.0.0",
+      "author": { "name": "Motrix" },
+      "origin": "builtin",
+      "categories": ["integration"],
+      "engines": { "motrix": "^2.0.0" },
+      "package": {
+        "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.url-resolver%401.0.0/motrix.url-resolver-1.0.0.moext",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 12345,
+        "signature": "c2lnbmF0dXJl"
+      },
+      "updatedAt": "2026-07-18"
     }
   ]
 }

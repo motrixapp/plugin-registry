@@ -9,7 +9,11 @@ describe('contract fixture (lockstep)', () => {
   // consumers — land the change in all three repos in one PR cycle.
   it('parses unchanged', () => {
     const parsed = RegistryFileSchema.parse(fixture)
-    expect(parsed.plugins).toHaveLength(2)
+    expect(parsed.plugins).toHaveLength(3)
+    // Guards that the vendored schema actually carries the Phase-2
+    // signature field (Zod would otherwise silently strip it).
+    const builtin = parsed.plugins.find((p) => p.id === 'motrix.url-resolver')
+    expect(builtin?.package?.signature).toBe('c2lnbmF0dXJl')
   })
 })
 

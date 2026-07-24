@@ -56,13 +56,17 @@ export const RegistryPluginSchema = z.object({
   permissions: z.array(z.string().min(1)).default([]),
   optionalPermissions: z.array(z.string().min(1)).default([]),
   hostPermissions: z.array(z.string().min(1)).default([]),
-  // Install pointer + integrity anchor. Required for community entries
-  // (CI-enforced); absent for builtins, which ship with the app.
+  // Historically absent for builtins; builtin entries carry it (plus
+  // `signature`) for independent hot updates.
   package: z
     .object({
       url: z.url(),
       sha256: z.string().regex(/^[a-f0-9]{64}$/),
       size: z.number().int().positive(),
+      // Phase 2 of the builtin independent-update design: detached ed25519
+      // signature (base64) over the .moext bytes. THE trust boundary for
+      // builtin hot updates; sha256 above is a pre-check only.
+      signature: z.string().min(1).optional(),
     })
     .optional(),
   repository: z.url().optional(),
