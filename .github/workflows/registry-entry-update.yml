@@ -69,9 +69,35 @@ jobs:
         run: pnpm entry:from-release "$PLUGIN_ID" "$PLUGIN_TAG"
       - name: Self-gate
         run: pnpm validate && pnpm test
+      # Prefer a GitHub App token for the PR so it TRIGGERS this repo's
+      # on:pull_request CI (a GITHUB_TOKEN-created PR does not, by GitHub's
+      # anti-recursion rule). Requires the App to also have Pull requests:
+      # write and its creds stored here; when absent we fall back to
+      # GITHUB_TOKEN (PR still opens, just without PR-triggered CI — the
+      # Self-gate above already validated the entry either way).
+      - name: Check PR-token App credentials
+        id: pr_app
+        env:
+          APP_ID: ${{ secrets.REGISTRY_DISPATCH_APP_ID || vars.REGISTRY_DISPATCH_APP_ID }}
+          APP_KEY: ${{ secrets.REGISTRY_DISPATCH_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "App creds not set — PR will use GITHUB_TOKEN (no PR-triggered CI)"
+          fi
+      - name: Mint PR token
+        id: pr_token
+        if: steps.pr_app.outputs.present == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.REGISTRY_DISPATCH_APP_ID || vars.REGISTRY_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_DISPATCH_APP_PRIVATE_KEY }}
       - name: Open PR
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ steps.pr_token.outputs.token || github.token }}
           branch: "auto/entry-${{ steps.in.outputs.id }}-${{ steps.in.outputs.version }}"
           title: "chore: update ${{ steps.in.outputs.id }} to ${{ steps.in.outputs.tag }}"
           body: |
