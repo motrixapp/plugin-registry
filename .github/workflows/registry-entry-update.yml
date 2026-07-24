@@ -1,0 +1,84 @@
+name: registry-entry-update
+# Regenerates a builtin plugin's registry entry from a signed builtin-plugins
+# release and opens a PR. Triggered by a repository_dispatch from
+# builtin-plugins' release workflow, or manually via workflow_dispatch.
+#
+# SECURITY: repository_dispatch client_payload is fully attacker-settable by
+# anyone holding the dispatch token, so id/tag are treated as untrusted:
+# passed through `env:` (never interpolated straight into a shell) and
+# strictly validated before use. The generator additionally verifies the
+# Ed25519 signature of the downloaded artifact against the pinned key and
+# binds the in-bundle manifest id/version to the tag, so a payload naming a
+# tag that is not a genuine Motrix-signed release cannot produce a package.
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: 'plugin id (e.g. motrix.url-resolver)'
+        required: true
+      tag:
+        description: 'release tag (e.g. motrix.url-resolver@1.0.0)'
+        required: true
+  repository_dispatch:
+    types: [builtin-released]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update-entry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Resolve & validate inputs
+        id: in
+        env:
+          # Untrusted for repository_dispatch; quoted into env, never into shell.
+          RAW_ID: ${{ github.event.inputs.id || github.event.client_payload.id }}
+          RAW_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RAW_ID" | grep -qE '^motrix\.[a-z0-9][a-z0-9-]*$'; then
+            echo "rejecting invalid plugin id: '$RAW_ID'"
+            exit 1
+          fi
+          if ! printf '%s' "$RAW_TAG" | grep -qE '^motrix\.[a-z0-9][a-z0-9-]*@[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
+            echo "rejecting invalid tag: '$RAW_TAG'"
+            exit 1
+          fi
+          case "$RAW_TAG" in
+            "$RAW_ID"@*) : ;;
+            *) echo "tag '$RAW_TAG' does not belong to id '$RAW_ID'"; exit 1 ;;
+          esac
+          {
+            echo "id=$RAW_ID"
+            echo "tag=$RAW_TAG"
+          } >> "$GITHUB_OUTPUT"
+      - name: Generate entry from the signed release
+        env:
+          PLUGIN_ID: ${{ steps.in.outputs.id }}
+          PLUGIN_TAG: ${{ steps.in.outputs.tag }}
+        run: pnpm entry:from-release "$PLUGIN_ID" "$PLUGIN_TAG"
+      - name: Self-gate
+        run: pnpm validate && pnpm test
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: "auto/entry-${{ steps.in.outputs.id }}"
+          title: "chore: update ${{ steps.in.outputs.id }} to ${{ steps.in.outputs.tag }}"
+          body: |
+            Automated registry entry update from a signed builtin-plugins release.
+
+            The generator verified the ed25519 signature against
+            `keys/signing-key.pub.pem` and bound the in-bundle manifest
+            id/version to the tag. Merging still requires the standard
+            validate/test/lockstep CI to pass.
+
+            - id: `${{ steps.in.outputs.id }}`
+            - tag: `${{ steps.in.outputs.tag }}`
+          commit-message: "chore: update ${{ steps.in.outputs.id }} package to ${{ steps.in.outputs.tag }}"
+          add-paths: plugins/
