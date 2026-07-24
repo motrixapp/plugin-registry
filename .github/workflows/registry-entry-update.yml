@@ -42,14 +42,17 @@ jobs:
           RAW_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
         run: |
           set -euo pipefail
-          if ! printf '%s' "$RAW_ID" | grep -qE '^motrix\.[a-z0-9][a-z0-9-]*$'; then
-            echo "rejecting invalid plugin id: '$RAW_ID'"
-            exit 1
-          fi
-          if ! printf '%s' "$RAW_TAG" | grep -qE '^motrix\.[a-z0-9][a-z0-9-]*@[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
-            echo "rejecting invalid tag: '$RAW_TAG'"
-            exit 1
-          fi
+          # Charset guard FIRST: reject any char outside the safe set — this
+          # also rejects newlines, so a multi-line payload cannot smuggle a
+          # second "key=" line into $GITHUB_OUTPUT (whose parser is
+          # last-write-wins). Only after this are the anchored shape checks
+          # meaningful (grep is line-oriented; the guard guarantees one line).
+          case "$RAW_ID" in ''|*[!a-z0-9.-]*) echo "rejecting id: '$RAW_ID'"; exit 1 ;; esac
+          case "$RAW_TAG" in ''|*[!A-Za-z0-9.@+-]*) echo "rejecting tag: '$RAW_TAG'"; exit 1 ;; esac
+          printf '%s' "$RAW_ID" | grep -qxE 'motrix\.[a-z0-9][a-z0-9-]*' \
+            || { echo "bad id shape: '$RAW_ID'"; exit 1; }
+          printf '%s' "$RAW_TAG" | grep -qxE 'motrix\.[a-z0-9][a-z0-9-]*@[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?' \
+            || { echo "bad tag shape: '$RAW_TAG'"; exit 1; }
           case "$RAW_TAG" in
             "$RAW_ID"@*) : ;;
             *) echo "tag '$RAW_TAG' does not belong to id '$RAW_ID'"; exit 1 ;;
@@ -57,6 +60,7 @@ jobs:
           {
             echo "id=$RAW_ID"
             echo "tag=$RAW_TAG"
+            echo "version=${RAW_TAG#*@}"
           } >> "$GITHUB_OUTPUT"
       - name: Generate entry from the signed release
         env:
@@ -68,7 +72,7 @@ jobs:
       - name: Open PR
         uses: peter-evans/create-pull-request@v7
         with:
-          branch: "auto/entry-${{ steps.in.outputs.id }}"
+          branch: "auto/entry-${{ steps.in.outputs.id }}-${{ steps.in.outputs.version }}"
           title: "chore: update ${{ steps.in.outputs.id }} to ${{ steps.in.outputs.tag }}"
           body: |
             Automated registry entry update from a signed builtin-plugins release.
