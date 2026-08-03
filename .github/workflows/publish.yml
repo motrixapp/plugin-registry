@@ -1,65 +1,1516 @@
-name: Publish
+# Production publish contract. Keep this workflow and release-contract v2 in
+# lockstep with the protected GitHub and Cloudflare configuration.
+#
+# Required production configuration before enabling remote writes:
+# - The `plugin-publishing` environment owns R2_ACCESS_KEY_ID,
+#   R2_SECRET_ACCESS_KEY, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN. For
+#   the current solo-maintainer setup, configure that maintainer as reviewer
+#   and disable "Prevent self-review" so the same maintainer can approve. This
+#   is an explicit human checkpoint, not independent/two-person review.
+# - R2 credentials are bucket-scoped Object Read & Write for `motrix-registry`;
+#   the Cloudflare token has only the website deployment permissions needed by
+#   the checked-in Wrangler configuration.
+# - Required repository variable WEBSITE_REPOSITORY is the canonical website
+#   `owner/repository`; it must not be inferred from a local checkout name.
+#   Optional WEBSITE_REF defaults to `main`. The gate resolves that ref once to
+#   an immutable source SHA. A workflow_dispatch SHA override is accepted only
+#   when it exactly equals the selected ref's current commit.
+# - If WEBSITE_REPOSITORY is private, configure a repository-level
+#   WEBSITE_READ_TOKEN restricted to Contents:read on only that repository; it
+#   must be available to pre-approval jobs, not only to the environment job.
+# - The selected ubuntu runner contains an AWS CLI version whose S3 PutObject
+#   supports --if-match/--if-none-match against R2. Consider pinning the runner
+#   image or installing a reviewed AWS CLI version before production use.
+# - R2 conditional PutObject behavior, the public HTTP ETag/R2 ETag equality,
+#   the fixed bucket/key, and the website Wrangler account/project binding have
+#   been exercised in a no-production-write rehearsal.
+# - Artifact retention (90 days here) is sufficient for audit/restore needs.
+# - The organization permits actions/upload-artifact@v7 and
+#   actions/download-artifact@v8. v7 `archive: false` uploads one raw file: its
+#   basename becomes the artifact name and `name` is ignored. v8 downloads it
+#   by `artifact-ids` with `skip-decompress: true`; `digest-mismatch: error`
+#   must remain enabled. Artifact ids and raw-file SHA-256 outputs are release
+#   identities. Do not add wrapper ZIPs or use `overwrite`.
+# - Current forward artifacts come only from this run. Any later historical or
+#   cross-run restore must verify GitHub artifact/run API metadata and download
+#   one recorded raw artifact id at a time; never select by mutable/custom name.
+#   The companion restore workflow must GET
+#   `/repos/{repo}/actions/artifacts/{id}` and `/actions/runs/{run_id}`, require
+#   id/name, expired=false, digest=`sha256:<recorded>`, workflow_run id/head SHA,
+#   expected workflow path/event, completed/success, then use v8 artifact-ids +
+#   repository + run-id + github-token + skip-decompress. Confirm these API
+#   fields against the target GitHub platform before changing this workflow.
+# - Promotion uses the checked-in release-contract v2 intent commands shown
+#   below. The immutable intent is uploaded before the first live mutation. Its
+#   operation id excludes workflow run/attempt and artifact ids. A retry or a new
+#   current-main dispatch with `resume_operation_id` must recover the exact
+#   journal-bound artifact ids rather than reinterpret the current live object.
+# - The first registry-v2 cutover is forward-only. The bounded previous live
+#   bytes are opaque exact backup/CAS and forensic evidence, not a parsed legacy
+#   registry or restore target. Do not pair them with a legacy website or roll
+#   only the registry back. Restore is enabled only after a successful
+#   registry-v2 release has retained matching registry and website artifacts,
+#   and only between such compatible registry-v2 tuples.
+# - Assets are deliberately outside the registry/website tuple. Their separate
+#   publication and verification process must complete before promotion.
 
-# Aggregates plugins/ into dist/plugins.json and uploads it (plus assets/)
-# to the motrix-registry R2 bucket served by dl.motrix.app/registry/*.
-# Uploads use the S3-compatible API so the credentials can stay scoped to
-# this one bucket (Object Read & Write) — wrangler's REST path would need
-# an account-wide Admin token (cloudflare/workers-sdk#9235).
-# Requires repo secrets: R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
-# CLOUDFLARE_ACCOUNT_ID.
+name: Coordinated registry and website publish
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      website_source_sha:
+        description: Exact approved motrix-website commit (lowercase 40-hex)
+        required: false
+        type: string
+      resume_operation_id:
+        description: Recover one retained release intent (lowercase 64-hex)
+        required: false
+        type: string
 
+# Deny by default; each job grants only what it uses. Artifact uploads use the
+# per-job artifact service token rather than repository Actions write access.
+permissions: {}
+
+# Publish and restore must use this same group. cancel-in-progress:false keeps
+# a running write path alive; assert-current rejects a superseded registry SHA
+# before approval and again immediately before any remote write.
 concurrency:
-  group: publish
+  group: registry-production
+  # GitHub's 2026 queue:max keeps all pending runs. Local actionlint 1.7.12
+  # predates this key and reports it as its sole schema warning.
+  queue: max
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  publish:
+  gate:
+    name: Gate exact main and resolve immutable sources
     runs-on: ubuntu-latest
-    environment: plugin-publishing
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      registry_source_sha: ${{ steps.sources.outputs.registry_source_sha }}
+      website_repository: ${{ steps.sources.outputs.website_repository }}
+      website_ref: ${{ steps.sources.outputs.website_ref }}
+      website_source_sha: ${{ steps.sources.outputs.website_source_sha }}
+      resume_operation_id: ${{ steps.sources.outputs.resume_operation_id }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
+      - name: Check out exact registry event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require current main and resolve website source
+        id: sources
+        env:
+          CURRENT_REPOSITORY_TOKEN: ${{ github.token }}
+          WEBSITE_REPOSITORY_TOKEN: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          WEBSITE_REPOSITORY_INPUT: ${{ vars.WEBSITE_REPOSITORY }}
+          WEBSITE_REF_INPUT: ${{ vars.WEBSITE_REF || 'main' }}
+          WEBSITE_SOURCE_SHA_INPUT: ${{ inputs.website_source_sha }}
+          RESUME_OPERATION_ID_INPUT: ${{ inputs.resume_operation_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "publish must run from refs/heads/main, got $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "GITHUB_SHA is not lowercase 40-hex" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "checkout HEAD differs from the event SHA" >&2
+            exit 1
+          fi
+
+          current_main_sha="$(GH_TOKEN="$CURRENT_REPOSITORY_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq .object.sha)"
+          if [[ "$current_main_sha" != "$GITHUB_SHA" ]]; then
+            echo "event SHA was superseded on main before candidate creation" >&2
+            exit 1
+          fi
+          if [[ ! "$WEBSITE_REPOSITORY_INPUT" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "required WEBSITE_REPOSITORY must be owner/repository" >&2
+            exit 1
+          fi
+          if [[ ! "$WEBSITE_REF_INPUT" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+             [[ "$WEBSITE_REF_INPUT" == *..* || "$WEBSITE_REF_INPUT" == *//* ]]; then
+            echo "WEBSITE_REF must be a safe branch/tag name" >&2
+            exit 1
+          fi
+
+          website_ref_sha="$(GH_TOKEN="$WEBSITE_REPOSITORY_TOKEN" gh api \
+            "repos/${WEBSITE_REPOSITORY_INPUT}/commits/${WEBSITE_REF_INPUT}" \
+            --jq .sha)"
+          if [[ ! "$website_ref_sha" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "selected website repository/ref did not resolve to lowercase 40-hex" >&2
+            exit 1
+          fi
+          if [[ -n "$RESUME_OPERATION_ID_INPUT" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != 'workflow_dispatch' ]] ||
+               [[ ! "$RESUME_OPERATION_ID_INPUT" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "resume_operation_id is allowed only on workflow_dispatch and must be lowercase 64-hex" >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$WEBSITE_SOURCE_SHA_INPUT" ]]; then
+            if [[ ! "$WEBSITE_SOURCE_SHA_INPUT" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "website source override must be lowercase 40-hex" >&2
+              exit 1
+            fi
+            if [[ "$WEBSITE_SOURCE_SHA_INPUT" != "$website_ref_sha" ]]; then
+              echo "website source override differs from the selected repository/ref" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "registry_source_sha=$GITHUB_SHA"
+            echo "website_repository=$WEBSITE_REPOSITORY_INPUT"
+            echo "website_ref=$WEBSITE_REF_INPUT"
+            echo "website_source_sha=$website_ref_sha"
+            echo "resume_operation_id=$RESUME_OPERATION_ID_INPUT"
+          } >> "$GITHUB_OUTPUT"
+
+  candidate:
+    name: Build immutable registry candidate once
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      registry_filename: ${{ steps.package.outputs.registry_filename }}
+      registry_artifact_id: ${{ steps.upload_registry.outputs.artifact-id }}
+      registry_artifact_sha256: ${{ steps.upload_registry.outputs.artifact-digest }}
+      candidate_manifest_filename: ${{ steps.manifest.outputs.candidate_manifest_filename }}
+      candidate_manifest_artifact_id: ${{ steps.upload_manifest.outputs.artifact-id }}
+      candidate_manifest_artifact_sha256: ${{ steps.upload_manifest.outputs.artifact-digest }}
+    steps:
+      - name: Check out exact registry source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.registry_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm validate
-      - run: pnpm aggregate
+          package-manager-cache: false
 
-      - name: Upload plugins.json to R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_REGION: auto
-          # R2 predates the aws CLI v2.23 default integrity checksums
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
-        run: >
-          aws s3api put-object
-          --endpoint-url "$R2_ENDPOINT"
-          --bucket motrix-registry
-          --key plugins.json
-          --body dist/plugins.json
-          --content-type "application/json; charset=utf-8"
+      - name: Set up repository pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          run_install: false
 
-      - name: Upload assets to R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_REGION: auto
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      - name: Install locked registry dependencies
+        run: pnpm install --frozen-lockfile
+
+      # These four gates run exactly once. No later job aggregates again.
+      - name: Type-check registry publisher
+        run: pnpm check
+
+      - name: Test registry publisher
+        run: pnpm test
+
+      - name: Validate registry entries
+        run: pnpm validate
+
+      - name: Aggregate registry exactly once
+        run: pnpm aggregate
+
+      - name: Package deterministic one-file registry ZIP
+        id: package
         run: |
-          if [ -d assets ]; then
-            aws s3 sync assets/ "s3://motrix-registry/assets/" --endpoint-url "$R2_ENDPOINT"
-          else
-            echo "no assets directory; skipping"
+          set -euo pipefail
+          registry_filename="registry-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          registry_path="${RUNNER_TEMP}/${registry_filename}"
+          node --input-type=module -e '
+            import { readFile, writeFile } from "node:fs/promises"
+            import { zipSync } from "fflate"
+            const payload = await readFile("dist/plugins.json")
+            const archive = zipSync(
+              { "plugins.json": [payload, { level: 0, mtime: new Date("1980-01-01T00:00:00Z") }] },
+              { level: 0 }
+            )
+            await writeFile(process.argv[1], archive, { flag: "wx", mode: 0o600 })
+          ' "$registry_path"
+          echo "registry_filename=$registry_filename" >> "$GITHUB_OUTPUT"
+          echo "registry_path=$registry_path" >> "$GITHUB_OUTPUT"
+
+      # With archive:false, the artifact identity is the raw deterministic ZIP.
+      # Its basename is the artifact name; a custom `name` would be ignored.
+      - name: Upload raw registry candidate ZIP
+        id: upload_registry
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.package.outputs.registry_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      # The manifest can only be constructed after GitHub returns the immutable
+      # artifact id and raw-file digest. The CLI validates both against the ZIP.
+      - name: Bind candidate manifest to uploaded registry artifact
+        id: manifest
+        env:
+          REGISTRY_ARTIFACT_ID: ${{ steps.upload_registry.outputs.artifact-id }}
+          REGISTRY_ARTIFACT_SHA256: ${{ steps.upload_registry.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          candidate_manifest_filename="registry-candidate-manifest-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          candidate_manifest_path="${RUNNER_TEMP}/${candidate_manifest_filename}"
+          pnpm exec tsx scripts/release-contract.ts candidate \
+            "${{ steps.package.outputs.registry_path }}" \
+            "$candidate_manifest_path" \
+            "$GITHUB_SHA" \
+            "$GITHUB_RUN_ID" \
+            "$REGISTRY_ARTIFACT_ID" \
+            "$REGISTRY_ARTIFACT_ID" \
+            "$REGISTRY_ARTIFACT_SHA256"
+          echo "candidate_manifest_filename=$candidate_manifest_filename" >> "$GITHUB_OUTPUT"
+          echo "candidate_manifest_path=$candidate_manifest_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw candidate manifest
+        id: upload_manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.manifest.outputs.candidate_manifest_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+  website:
+    name: Build website from exact verified registry artifact
+    needs: [gate, candidate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      website_filename: ${{ steps.build.outputs.website_filename }}
+      website_artifact_id: ${{ steps.upload_website.outputs.artifact-id }}
+      website_artifact_sha256: ${{ steps.upload_website.outputs.artifact-digest }}
+      website_build_run_id: ${{ github.run_id }}
+      website_source_sha: ${{ needs.gate.outputs.website_source_sha }}
+    steps:
+      - name: Check out exact registry publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.registry_source_sha }}
+          path: publisher
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out exact website source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.gate.outputs.website_repository }}
+          ref: ${{ needs.gate.outputs.website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          path: website
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm exact website checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C website rev-parse HEAD)" = "${{ needs.gate.outputs.website_source_sha }}"
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install locked publisher and website dependencies
+        run: |
+          set -euo pipefail
+          pnpm -C publisher install --frozen-lockfile
+          pnpm -C website install --frozen-lockfile
+
+      - name: Download raw registry ZIP by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.registry_artifact_id }}
+          path: ${{ runner.temp }}/website-registry-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download raw candidate manifest by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.candidate_manifest_artifact_id }}
+          path: ${{ runner.temp }}/website-manifest-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Verify raw candidate downloads and safely extract
+        env:
+          REGISTRY_FILENAME: ${{ needs.candidate.outputs.registry_filename }}
+          REGISTRY_ARTIFACT_ID: ${{ needs.candidate.outputs.registry_artifact_id }}
+          REGISTRY_ARTIFACT_SHA256: ${{ needs.candidate.outputs.registry_artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ needs.candidate.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_SHA256: ${{ needs.candidate.outputs.candidate_manifest_artifact_sha256 }}
+        run: |
+          set -euo pipefail
+          registry_path="${RUNNER_TEMP}/website-registry-input/${REGISTRY_FILENAME}"
+          manifest_path="${RUNNER_TEMP}/website-manifest-input/${CANDIDATE_MANIFEST_FILENAME}"
+          test "$(sha256sum "$registry_path" | awk '{print $1}')" = "$REGISTRY_ARTIFACT_SHA256"
+          test "$(sha256sum "$manifest_path" | awk '{print $1}')" = "$CANDIDATE_MANIFEST_SHA256"
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-registry \
+            "$manifest_path" \
+            "$registry_path" \
+            "$REGISTRY_ARTIFACT_ID" \
+            "${RUNNER_TEMP}/website-verified-registry"
+
+      - name: Run website quality gates
+        run: |
+          set -euo pipefail
+          pnpm -C website lint
+          pnpm -C website test
+          pnpm -C website check:dl
+          pnpm -C website test:dl
+
+      # The release wrapper serves only the publisher-verified plugins.json on
+      # loopback, builds once, embeds the strict tuple manifest, and writes a
+      # deterministic ZIP containing only manifest + dist/**.
+      - name: Build deterministic prebuilt website artifact
+        id: build
+        env:
+          WEBSITE_SOURCE_SHA: ${{ needs.gate.outputs.website_source_sha }}
+        run: |
+          set -euo pipefail
+          website_filename="website-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          website_path="${RUNNER_TEMP}/${website_filename}"
+          pnpm -C website registry:build:candidate -- \
+            --candidate-root "${RUNNER_TEMP}/website-verified-registry/registry" \
+            --candidate-manifest "${RUNNER_TEMP}/website-manifest-input/${{ needs.candidate.outputs.candidate_manifest_filename }}" \
+            --website-source-sha "$WEBSITE_SOURCE_SHA" \
+            --build-run-id "$GITHUB_RUN_ID" \
+            --artifact-out "$website_path" \
+            --dist dist
+          echo "website_filename=$website_filename" >> "$GITHUB_OUTPUT"
+          echo "website_path=$website_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw prebuilt website ZIP
+        id: upload_website
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.build.outputs.website_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      # Round-trip through GitHub's artifact service now, so downstream jobs
+      # consume the same raw bytes and identity validated here.
+      - name: Download raw website ZIP by returned artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.upload_website.outputs.artifact-id }}
+          path: ${{ runner.temp }}/website-roundtrip-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Verify complete candidate/website promotion tuple
+        env:
+          WEBSITE_ARTIFACT_ID: ${{ steps.upload_website.outputs.artifact-id }}
+          WEBSITE_ARTIFACT_SHA256: ${{ steps.upload_website.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          website_path="${RUNNER_TEMP}/website-roundtrip-input/${{ steps.build.outputs.website_filename }}"
+          test "$(sha256sum "$website_path" | awk '{print $1}')" = "$WEBSITE_ARTIFACT_SHA256"
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-promotion \
+            "${RUNNER_TEMP}/website-manifest-input/${{ needs.candidate.outputs.candidate_manifest_filename }}" \
+            "${RUNNER_TEMP}/website-registry-input/${{ needs.candidate.outputs.registry_filename }}" \
+            "${{ needs.candidate.outputs.registry_artifact_id }}" \
+            "$website_path" \
+            "$WEBSITE_ARTIFACT_ID" \
+            "$WEBSITE_ARTIFACT_ID" \
+            "$WEBSITE_ARTIFACT_SHA256" \
+            "${{ needs.gate.outputs.website_source_sha }}" \
+            "$GITHUB_RUN_ID" \
+            "${RUNNER_TEMP}/website-roundtrip-verified"
+
+  preflight:
+    name: No-write pre-approval verification
+    needs: [gate, candidate, website]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out exact registry publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.registry_source_sha }}
+          path: publisher
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out exact website source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.gate.outputs.website_repository }}
+          ref: ${{ needs.website.outputs.website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          path: website
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.18.0
+          run_install: false
+
+      - name: Install locked publisher and website dependencies
+        run: |
+          set -euo pipefail
+          pnpm -C publisher install --frozen-lockfile
+          pnpm -C website install --frozen-lockfile
+
+      - name: Download raw registry ZIP by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.registry_artifact_id }}
+          path: ${{ runner.temp }}/preflight-registry-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download raw candidate manifest by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.candidate_manifest_artifact_id }}
+          path: ${{ runner.temp }}/preflight-manifest-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download raw website ZIP by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.website.outputs.website_artifact_id }}
+          path: ${{ runner.temp }}/preflight-website-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Reject supersession and verify exact promotion bundle
+        id: verify
+        env:
+          CURRENT_REPOSITORY_TOKEN: ${{ github.token }}
+          WEBSITE_REPOSITORY_TOKEN: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          WEBSITE_REPOSITORY: ${{ needs.gate.outputs.website_repository }}
+          WEBSITE_REF: ${{ needs.gate.outputs.website_ref }}
+          WEBSITE_SOURCE_SHA: ${{ needs.website.outputs.website_source_sha }}
+          REGISTRY_FILENAME: ${{ needs.candidate.outputs.registry_filename }}
+          REGISTRY_ARTIFACT_SHA256: ${{ needs.candidate.outputs.registry_artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ needs.candidate.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_SHA256: ${{ needs.candidate.outputs.candidate_manifest_artifact_sha256 }}
+          WEBSITE_FILENAME: ${{ needs.website.outputs.website_filename }}
+          WEBSITE_ARTIFACT_SHA256: ${{ needs.website.outputs.website_artifact_sha256 }}
+        run: |
+          set -euo pipefail
+          registry_path="${RUNNER_TEMP}/preflight-registry-input/${REGISTRY_FILENAME}"
+          manifest_path="${RUNNER_TEMP}/preflight-manifest-input/${CANDIDATE_MANIFEST_FILENAME}"
+          website_path="${RUNNER_TEMP}/preflight-website-input/${WEBSITE_FILENAME}"
+
+          test "$(sha256sum "$registry_path" | awk '{print $1}')" = "$REGISTRY_ARTIFACT_SHA256"
+          test "$(sha256sum "$manifest_path" | awk '{print $1}')" = "$CANDIDATE_MANIFEST_SHA256"
+          test "$(sha256sum "$website_path" | awk '{print $1}')" = "$WEBSITE_ARTIFACT_SHA256"
+
+          current_main_sha="$(GH_TOKEN="$CURRENT_REPOSITORY_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq .object.sha)"
+          pnpm -C publisher exec tsx scripts/release-contract.ts assert-current \
+            "${{ needs.gate.outputs.registry_source_sha }}" \
+            "$current_main_sha"
+          website_ref_sha="$(GH_TOKEN="$WEBSITE_REPOSITORY_TOKEN" gh api \
+            "repos/${WEBSITE_REPOSITORY}/commits/${WEBSITE_REF}" \
+            --jq .sha)"
+          test "$website_ref_sha" = "$WEBSITE_SOURCE_SHA"
+
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-promotion \
+            "$manifest_path" \
+            "$registry_path" \
+            "${{ needs.candidate.outputs.registry_artifact_id }}" \
+            "$website_path" \
+            "${{ needs.website.outputs.website_artifact_id }}" \
+            "${{ needs.website.outputs.website_artifact_id }}" \
+            "$WEBSITE_ARTIFACT_SHA256" \
+            "${{ needs.website.outputs.website_source_sha }}" \
+            "${{ needs.website.outputs.website_build_run_id }}" \
+            "${RUNNER_TEMP}/preflight-verified"
+
+          candidate_sha="$(node -e 'console.log(require(process.argv[1]).registry.sha256)' "$manifest_path")"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate prebuilt website deploy without remote writes
+        run: |
+          set -euo pipefail
+          pnpm -C website cf:deploy:prebuilt:dry -- \
+            --artifact-root "${RUNNER_TEMP}/preflight-verified/website" \
+            --expected-registry-sha256 "${{ steps.verify.outputs.candidate_sha }}"
+
+      # An explicit recovery must expose its original immutable tuple before the
+      # environment approval, even though this current-main run also built a new
+      # ordinary candidate. These steps are no-write and use no production secret.
+      - name: Locate requested recovery intent before approval
+        id: recovery_lookup
+        if: ${{ needs.gate.outputs.resume_operation_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION_ID: ${{ needs.gate.outputs.resume_operation_id }}
+        run: |
+          set -euo pipefail
+          intent_filename="registry-release-intent-${OPERATION_ID}.json"
+          response="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            -f name="$intent_filename" -f per_page=100)"
+          artifact="$(jq --arg name "$intent_filename" \
+            '[.artifacts[] | select(.name == $name)] | if length == 1 then .[0] else error("recovery intent is absent or ambiguous") end' \
+            <<< "$response")"
+          test "$(jq -er '.expired' <<< "$artifact")" = 'false'
+          artifact_id="$(jq -er '.id | tostring' <<< "$artifact")"
+          artifact_sha256="$(jq -er '.digest | sub("^sha256:"; "")' <<< "$artifact")"
+          producer_run_id="$(jq -er '.workflow_run.id | tostring' <<< "$artifact")"
+          producer_head_sha="$(jq -er '.workflow_run.head_sha' <<< "$artifact")"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$artifact_sha256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$producer_run_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$producer_head_sha" =~ ^[a-f0-9]{40}$ ]]
+          {
+            echo "filename=$intent_filename"
+            echo "artifact_id=$artifact_id"
+            echo "artifact_sha256=$artifact_sha256"
+            echo "producer_run_id=$producer_run_id"
+            echo "producer_head_sha=$producer_head_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download requested raw recovery intent before approval
+        if: ${{ needs.gate.outputs.resume_operation_id != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.recovery_lookup.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.recovery_lookup.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/preflight-recovery-intent
+          skip-decompress: true
+          digest-mismatch: error
+
+      # inspect-release-intent-v2 validates the strict
+      # journal and emits the three original artifact identities. This preflight
+      # also checks their GitHub metadata so approval reviews the old operation,
+      # not merely the unrelated candidate built by the recovery dispatch.
+      - name: Verify requested recovery intent provenance before approval
+        if: ${{ needs.gate.outputs.resume_operation_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION_ID: ${{ needs.gate.outputs.resume_operation_id }}
+          INTENT_FILENAME: ${{ steps.recovery_lookup.outputs.filename }}
+          INTENT_ARTIFACT_ID: ${{ steps.recovery_lookup.outputs.artifact_id }}
+          INTENT_ARTIFACT_SHA256: ${{ steps.recovery_lookup.outputs.artifact_sha256 }}
+          PRODUCER_RUN_ID: ${{ steps.recovery_lookup.outputs.producer_run_id }}
+          PRODUCER_HEAD_SHA: ${{ steps.recovery_lookup.outputs.producer_head_sha }}
+        run: |
+          set -euo pipefail
+          intent_path="${RUNNER_TEMP}/preflight-recovery-intent/${INTENT_FILENAME}"
+          test "$(sha256sum "$intent_path" | awk '{print $1}')" = "$INTENT_ARTIFACT_SHA256"
+          inspect_path="${RUNNER_TEMP}/preflight-recovery-inspect.json"
+          pnpm -C publisher exec tsx scripts/release-contract.ts inspect-release-intent-v2 \
+            "$intent_path" "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$OPERATION_ID" "$inspect_path"
+          test "$(jq -er '.producer.registrySourceSha' "$inspect_path")" = "$PRODUCER_HEAD_SHA"
+          run_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCER_RUN_ID}")"
+          test "$(jq -er '.repository.full_name' <<< "$run_meta")" = "$GITHUB_REPOSITORY"
+          test "$(jq -er '.head_repository.full_name' <<< "$run_meta")" = "$GITHUB_REPOSITORY"
+          test "$(jq -er '.head_sha' <<< "$run_meta")" = "$PRODUCER_HEAD_SHA"
+          test "$(jq -er '.head_branch' <<< "$run_meta")" = 'main'
+          workflow_id="$(jq -er '.workflow_id | tostring' <<< "$run_meta")"
+          workflow_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}")"
+          test "$(jq -er '.path' <<< "$workflow_meta")" = '.github/workflows/publish.yml'
+          run_path="$(jq -er '.path' <<< "$run_meta")"
+          test "${run_path%%@*}" = '.github/workflows/publish.yml'
+          producer_repository_id="$(jq -er '.repository.id | tostring' <<< "$run_meta")"
+          producer_head_repository_id="$(jq -er '.head_repository.id | tostring' <<< "$run_meta")"
+          event="$(jq -er '.event' <<< "$run_meta")"
+          [[ "$event" = 'push' || "$event" = 'workflow_dispatch' ]]
+          intent_artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${INTENT_ARTIFACT_ID}")"
+          test "$(jq -er '.name' <<< "$intent_artifact")" = "$INTENT_FILENAME"
+          test "$(jq -er '.expired' <<< "$intent_artifact")" = 'false'
+          test "$(jq -er '.digest' <<< "$intent_artifact")" = "sha256:${INTENT_ARTIFACT_SHA256}"
+          test "$(jq -er '.workflow_run.id | tostring' <<< "$intent_artifact")" = "$PRODUCER_RUN_ID"
+          test "$(jq -er '.workflow_run.repository_id | tostring' <<< "$intent_artifact")" = "$producer_repository_id"
+          test "$(jq -er '.workflow_run.head_repository_id | tostring' <<< "$intent_artifact")" = "$producer_head_repository_id"
+          test "$(jq -er '.workflow_run.head_sha' <<< "$intent_artifact")" = "$PRODUCER_HEAD_SHA"
+          for key in candidate_manifest registry website; do
+            id="$(jq -er ".artifacts.${key}.id" "$inspect_path")"
+            sha256="$(jq -er ".artifacts.${key}.sha256" "$inspect_path")"
+            filename="$(jq -er ".artifacts.${key}.filename" "$inspect_path")"
+            artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}")"
+            test "$(jq -er '.name' <<< "$artifact")" = "$filename"
+            test "$(jq -er '.expired' <<< "$artifact")" = 'false'
+            test "$(jq -er '.digest' <<< "$artifact")" = "sha256:${sha256}"
+            test "$(jq -er '.workflow_run.id | tostring' <<< "$artifact")" = "$PRODUCER_RUN_ID"
+            test "$(jq -er '.workflow_run.repository_id | tostring' <<< "$artifact")" = "$producer_repository_id"
+            test "$(jq -er '.workflow_run.head_repository_id | tostring' <<< "$artifact")" = "$producer_head_repository_id"
+            test "$(jq -er '.workflow_run.head_sha' <<< "$artifact")" = "$PRODUCER_HEAD_SHA"
+          done
+          {
+            echo "## Explicit recovery intent ready for approval"
+            echo "- Operation: \`$OPERATION_ID\`"
+            echo "- Intent artifact: id \`$INTENT_ARTIFACT_ID\`, SHA-256 \`$INTENT_ARTIFACT_SHA256\`"
+            echo "- Original producer run: \`$PRODUCER_RUN_ID\`, source \`$PRODUCER_HEAD_SHA\`"
+            echo "- Original candidate/registry/website artifact metadata is exact and non-expired."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record reviewable no-write evidence
+        run: |
+          {
+            echo "## Pre-approval exact-artifact evidence"
+            echo "- Registry source: \`${{ needs.gate.outputs.registry_source_sha }}\`"
+            echo "- Registry artifact: id \`${{ needs.candidate.outputs.registry_artifact_id }}\`, SHA-256 \`${{ needs.candidate.outputs.registry_artifact_sha256 }}\`"
+            echo "- Candidate payload SHA-256: \`${{ steps.verify.outputs.candidate_sha }}\`"
+            echo "- Website source: \`${{ needs.website.outputs.website_source_sha }}\`"
+            echo "- Website artifact: id \`${{ needs.website.outputs.website_artifact_id }}\`, SHA-256 \`${{ needs.website.outputs.website_artifact_sha256 }}\`"
+            echo "- Website build run: \`${{ needs.website.outputs.website_build_run_id }}\`"
+            echo "- Exact forward tuple verification and prebuilt deployment dry-run passed; no remote writes occurred."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Approved atomic cutover
+    needs: [gate, candidate, website, preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: plugin-publishing
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out exact registry publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.registry_source_sha }}
+          path: publisher
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out exact website source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.gate.outputs.website_repository }}
+          ref: ${{ needs.website.outputs.website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          path: website
+          fetch-depth: 1
+          persist-credentials: false
+
+      # No dependency cache is restored in the job that can access production
+      # secrets. Locked installs are made from the two exact source commits.
+      - name: Set up Node without package-manager cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up pnpm without dependency cache
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.18.0
+          run_install: false
+
+      # Activation prerequisite: exercise both verifier CLIs and Wrangler's
+      # prebuilt-only path on a clean ubuntu runner with lifecycle scripts
+      # disabled. If a native package truly requires a script, replace this
+      # with a reviewed/pinned allow-list rather than enabling all scripts.
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          set -euo pipefail
+          pnpm -C publisher install --frozen-lockfile --ignore-scripts
+          pnpm -C website install --frozen-lockfile --ignore-scripts
+
+      - name: Download raw registry ZIP by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.registry_artifact_id }}
+          path: ${{ runner.temp }}/promotion-registry-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download raw candidate manifest by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.candidate_manifest_artifact_id }}
+          path: ${{ runner.temp }}/promotion-manifest-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download raw website ZIP by artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.website.outputs.website_artifact_id }}
+          path: ${{ runner.temp }}/promotion-website-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      # Approval may have taken time. Repeat every byte/id/source verification
+      # into a new extraction root and re-check current main before any write.
+      - name: Repeat complete post-approval verification
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_FILENAME: ${{ needs.candidate.outputs.registry_filename }}
+          REGISTRY_ARTIFACT_SHA256: ${{ needs.candidate.outputs.registry_artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ needs.candidate.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_SHA256: ${{ needs.candidate.outputs.candidate_manifest_artifact_sha256 }}
+          WEBSITE_FILENAME: ${{ needs.website.outputs.website_filename }}
+          WEBSITE_ARTIFACT_SHA256: ${{ needs.website.outputs.website_artifact_sha256 }}
+        run: |
+          set -euo pipefail
+          registry_path="${RUNNER_TEMP}/promotion-registry-input/${REGISTRY_FILENAME}"
+          manifest_path="${RUNNER_TEMP}/promotion-manifest-input/${CANDIDATE_MANIFEST_FILENAME}"
+          website_path="${RUNNER_TEMP}/promotion-website-input/${WEBSITE_FILENAME}"
+
+          test "$(sha256sum "$registry_path" | awk '{print $1}')" = "$REGISTRY_ARTIFACT_SHA256"
+          test "$(sha256sum "$manifest_path" | awk '{print $1}')" = "$CANDIDATE_MANIFEST_SHA256"
+          test "$(sha256sum "$website_path" | awk '{print $1}')" = "$WEBSITE_ARTIFACT_SHA256"
+
+          current_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          pnpm -C publisher exec tsx scripts/release-contract.ts assert-current \
+            "${{ needs.gate.outputs.registry_source_sha }}" \
+            "$current_main_sha"
+
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-promotion \
+            "$manifest_path" \
+            "$registry_path" \
+            "${{ needs.candidate.outputs.registry_artifact_id }}" \
+            "$website_path" \
+            "${{ needs.website.outputs.website_artifact_id }}" \
+            "${{ needs.website.outputs.website_artifact_id }}" \
+            "$WEBSITE_ARTIFACT_SHA256" \
+            "${{ needs.website.outputs.website_source_sha }}" \
+            "${{ needs.website.outputs.website_build_run_id }}" \
+            "${RUNNER_TEMP}/promotion-verified"
+
+          candidate_sha="$(node -e 'console.log(require(process.argv[1]).registry.sha256)' "$manifest_path")"
+          test "$(sha256sum "${RUNNER_TEMP}/promotion-verified/registry/plugins.json" | awk '{print $1}')" = "$candidate_sha"
+          website_dist_sha="$(node -e 'console.log(require(process.argv[1]).distSha256)' \
+            "${RUNNER_TEMP}/promotion-verified/website/website-artifact-manifest.json")"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "website_dist_sha=$website_dist_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Repeat prebuilt website deploy dry-run after approval
+        run: |
+          set -euo pipefail
+          pnpm -C website cf:deploy:prebuilt:dry -- \
+            --artifact-root "${RUNNER_TEMP}/promotion-verified/website" \
+            --expected-registry-sha256 "${{ steps.verify.outputs.candidate_sha }}"
+
+      # Assets are outside the coordinated tuple and therefore cannot mutate in
+      # this workflow. A future asset publisher needs its own immutable manifest,
+      # verification, and recovery protocol before this guard may be removed.
+      - name: Refuse unattested in-band asset publication
+        run: |
+          set -euo pipefail
+          test "$(git -C publisher rev-parse HEAD)" = "${{ needs.gate.outputs.registry_source_sha }}"
+          if [[ -d publisher/assets ]] &&
+             [[ -n "$(find publisher/assets -mindepth 1 -print -quit)" ]]; then
+            echo "publisher/assets is non-empty; publish it through a separately attested process" >&2
+            exit 1
           fi
+
+      # The operation id deliberately excludes workflow run/attempt and artifact
+      # ids. A current-main workflow_dispatch may name an older operation after
+      # the original runner died. The repository-wide lookup then redownloads the
+      # original journal-bound tuple from its producer run, never from the retry.
+      - name: Discover stable immutable release intent
+        id: intent_lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA256: ${{ steps.verify.outputs.candidate_sha }}
+          WEBSITE_DIST_SHA256: ${{ steps.verify.outputs.website_dist_sha }}
+          REGISTRY_SOURCE_SHA: ${{ needs.gate.outputs.registry_source_sha }}
+          WEBSITE_SOURCE_SHA: ${{ needs.website.outputs.website_source_sha }}
+          RESUME_OPERATION_ID: ${{ needs.gate.outputs.resume_operation_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$RESUME_OPERATION_ID" ]]; then
+            operation_id="$RESUME_OPERATION_ID"
+          else
+            operation_id="$({
+              printf '%s\n' 'motrix-release-intent-v2'
+              printf '%s\n' "$GITHUB_REPOSITORY"
+              printf '%s\n' "$REGISTRY_SOURCE_SHA" "$WEBSITE_SOURCE_SHA"
+              printf '%s\n' "$CANDIDATE_SHA256" "$WEBSITE_DIST_SHA256"
+            } | sha256sum | awk '{print $1}')"
+          fi
+          [[ "$operation_id" =~ ^[a-f0-9]{64}$ ]]
+          intent_filename="registry-release-intent-${operation_id}.json"
+          response="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            -f name="$intent_filename" -f per_page=100)"
+          exact_count="$(jq --arg name "$intent_filename" \
+            '[.artifacts[] | select(.name == $name)] | length' <<< "$response")"
+          if [[ "$exact_count" -gt 1 ]]; then
+            echo "multiple release intents exist for one stable operation id" >&2
+            exit 1
+          fi
+
+          existing_id=''
+          existing_sha256=''
+          producer_run_id="$GITHUB_RUN_ID"
+          producer_head_sha="$REGISTRY_SOURCE_SHA"
+          found=false
+          if [[ "$exact_count" -eq 1 ]]; then
+            artifact="$(jq --arg name "$intent_filename" \
+              '.artifacts[] | select(.name == $name)' <<< "$response")"
+            test "$(jq -er '.expired' <<< "$artifact")" = 'false'
+            existing_id="$(jq -er '.id | tostring' <<< "$artifact")"
+            existing_sha256="$(jq -er '.digest | strings | sub("^sha256:"; "")' <<< "$artifact")"
+            producer_run_id="$(jq -er '.workflow_run.id | tostring' <<< "$artifact")"
+            producer_head_sha="$(jq -er '.workflow_run.head_sha' <<< "$artifact")"
+            [[ "$existing_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$existing_sha256" =~ ^[a-f0-9]{64}$ ]]
+            [[ "$producer_run_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$producer_head_sha" =~ ^[a-f0-9]{40}$ ]]
+            found=true
+          fi
+          if [[ -n "$RESUME_OPERATION_ID" && "$found" != 'true' ]]; then
+            echo "requested resume operation has no unique retained intent" >&2
+            exit 1
+          fi
+          {
+            echo "operation_id=$operation_id"
+            echo "intent_filename=$intent_filename"
+            echo "found=$found"
+            echo "existing_id=$existing_id"
+            echo "existing_sha256=$existing_sha256"
+            echo "producer_run_id=$producer_run_id"
+            echo "producer_head_sha=$producer_head_sha"
+            echo "is_recovery=$([[ -n "$RESUME_OPERATION_ID" ]] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+      # release-intent-v2 strictly verifies the downloaded candidate manifest,
+      # registry ZIP, website ZIP, bounded opaque previous bytes, and backup readback.
+      # It records the complete artifact tuple without parsing or classifying the
+      # previous object. The backup key is stable across rerun attempts and an
+      # already-existing object must match byte-for-byte.
+      - name: Create initial backup and release intent when absent
+        id: create_intent
+        if: ${{ steps.intent_lookup.outputs.found == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: motrix-registry
+          R2_KEY: plugins.json
+          OPERATION_ID: ${{ steps.intent_lookup.outputs.operation_id }}
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+          CANDIDATE_SHA256: ${{ steps.verify.outputs.candidate_sha }}
+          REGISTRY_FILENAME: ${{ needs.candidate.outputs.registry_filename }}
+          REGISTRY_ARTIFACT_ID: ${{ needs.candidate.outputs.registry_artifact_id }}
+          REGISTRY_ARTIFACT_SHA256: ${{ needs.candidate.outputs.registry_artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ needs.candidate.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_ARTIFACT_ID: ${{ needs.candidate.outputs.candidate_manifest_artifact_id }}
+          CANDIDATE_MANIFEST_ARTIFACT_SHA256: ${{ needs.candidate.outputs.candidate_manifest_artifact_sha256 }}
+          WEBSITE_FILENAME: ${{ needs.website.outputs.website_filename }}
+          WEBSITE_ARTIFACT_ID: ${{ needs.website.outputs.website_artifact_id }}
+          WEBSITE_ARTIFACT_SHA256: ${{ needs.website.outputs.website_artifact_sha256 }}
+          WEBSITE_SOURCE_SHA: ${{ needs.website.outputs.website_source_sha }}
+          WEBSITE_BUILD_RUN_ID: ${{ needs.website.outputs.website_build_run_id }}
+        run: |
+          set -euo pipefail
+          current_path="${RUNNER_TEMP}/intent-current-plugins.json"
+          current_meta="${RUNNER_TEMP}/intent-current-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$R2_KEY" \
+            "$current_path" > "$current_meta"
+          previous_sha256="$(sha256sum "$current_path" | awk '{print $1}')"
+          previous_etag="$(jq -er '.ETag | strings | select(length > 0)' "$current_meta")"
+          if [[ "$previous_sha256" = "$CANDIDATE_SHA256" ]]; then
+            echo "candidate is already live but no retained intent was found; refusing to reinterpret it as the previous state" >&2
+            exit 1
+          fi
+
+          backup_key="private/backups/plugins/${OPERATION_ID}-${previous_sha256}.json"
+          backup_path="${RUNNER_TEMP}/intent-backup-plugins.json"
+          backup_meta="${RUNNER_TEMP}/intent-backup-meta.json"
+          if aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$backup_key" \
+            "$backup_path" > "$backup_meta" 2> "${RUNNER_TEMP}/intent-backup-get.err"; then
+            echo "reusing exact immutable backup left by an interrupted pre-intent attempt"
+          else
+            aws s3api put-object \
+              --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$backup_key" \
+              --body "$current_path" --content-type "application/json; charset=utf-8" \
+              --if-none-match '*' > "${RUNNER_TEMP}/intent-backup-put-meta.json"
+            aws s3api get-object \
+              --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$backup_key" \
+              "$backup_path" > "$backup_meta"
+          fi
+          backup_etag="$(jq -er '.ETag | strings | select(length > 0)' "$backup_meta")"
+          test "$(sha256sum "$backup_path" | awk '{print $1}')" = "$previous_sha256"
+          cmp --silent "$current_path" "$backup_path"
+
+          intent_path="${RUNNER_TEMP}/${INTENT_FILENAME}"
+          pnpm -C publisher exec tsx scripts/release-contract.ts release-intent-v2 \
+            "$current_path" "$previous_etag" "$backup_path" "$backup_key" "$backup_etag" \
+            "${RUNNER_TEMP}/promotion-manifest-input/${CANDIDATE_MANIFEST_FILENAME}" \
+            "$CANDIDATE_MANIFEST_FILENAME" "$CANDIDATE_MANIFEST_ARTIFACT_ID" "$CANDIDATE_MANIFEST_ARTIFACT_SHA256" \
+            "${RUNNER_TEMP}/promotion-registry-input/${REGISTRY_FILENAME}" \
+            "$REGISTRY_FILENAME" "$REGISTRY_ARTIFACT_ID" "$REGISTRY_ARTIFACT_SHA256" \
+            "${RUNNER_TEMP}/promotion-website-input/${WEBSITE_FILENAME}" \
+            "$WEBSITE_FILENAME" "$WEBSITE_ARTIFACT_ID" "$WEBSITE_ARTIFACT_SHA256" \
+            "$WEBSITE_SOURCE_SHA" "$WEBSITE_BUILD_RUN_ID" \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$OPERATION_ID" "$intent_path"
+          pnpm -C publisher exec tsx scripts/release-contract.ts validate-release-intent-v2 \
+            "$intent_path" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$OPERATION_ID"
+          echo "intent_path=$intent_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw immutable release intent before live mutation
+        id: upload_intent
+        if: ${{ steps.intent_lookup.outputs.found == 'false' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.create_intent.outputs.intent_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Select exact retained intent identity
+        id: intent_identity
+        env:
+          FOUND: ${{ steps.intent_lookup.outputs.found }}
+          PRODUCER_RUN_ID: ${{ steps.intent_lookup.outputs.producer_run_id }}
+          EXISTING_ID: ${{ steps.intent_lookup.outputs.existing_id }}
+          EXISTING_SHA256: ${{ steps.intent_lookup.outputs.existing_sha256 }}
+          CREATED_ID: ${{ steps.upload_intent.outputs.artifact-id }}
+          CREATED_SHA256: ${{ steps.upload_intent.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$FOUND" = 'true' ]]; then
+            intent_id="$EXISTING_ID"
+            intent_sha256="$EXISTING_SHA256"
+          else
+            intent_id="$CREATED_ID"
+            intent_sha256="${CREATED_SHA256#sha256:}"
+          fi
+          [[ "$intent_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$intent_sha256" =~ ^[a-f0-9]{64}$ ]]
+          {
+            echo "artifact_id=$intent_id"
+            echo "artifact_sha256=$intent_sha256"
+            echo "producer_run_id=$PRODUCER_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download raw release intent by exact artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.intent_identity.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.intent_identity.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/retained-intent-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      # inspect-release-intent-v2 emits only schema-checked
+      # ids, lowercase digests, and safe raw artifact basenames from the intent.
+      - name: Inspect retained intent and recover its original artifact tuple
+        id: inspect_intent
+        env:
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+          INTENT_SHA256: ${{ steps.intent_identity.outputs.artifact_sha256 }}
+          OPERATION_ID: ${{ steps.intent_lookup.outputs.operation_id }}
+          PRODUCER_RUN_ID: ${{ steps.intent_identity.outputs.producer_run_id }}
+        run: |
+          set -euo pipefail
+          intent_path="${RUNNER_TEMP}/retained-intent-input/${INTENT_FILENAME}"
+          test "$(sha256sum "$intent_path" | awk '{print $1}')" = "$INTENT_SHA256"
+          inspect_path="${RUNNER_TEMP}/release-intent-inspect.json"
+          pnpm -C publisher exec tsx scripts/release-contract.ts inspect-release-intent-v2 \
+            "$intent_path" "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$OPERATION_ID" "$inspect_path"
+          producer_source_sha="$(jq -er '.producer.registrySourceSha' "$inspect_path")"
+          website_source_sha="$(jq -er '.producer.websiteSourceSha' "$inspect_path")"
+          website_build_run_id="$(jq -er '.producer.websiteBuildRunId' "$inspect_path")"
+          [[ "$producer_source_sha" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$website_source_sha" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$website_build_run_id" =~ ^[1-9][0-9]*$ ]]
+          {
+            echo "producer_source_sha=$producer_source_sha"
+            echo "website_source_sha=$website_source_sha"
+            echo "website_build_run_id=$website_build_run_id"
+          } >> "$GITHUB_OUTPUT"
+          for key in candidate_manifest registry website; do
+            id="$(jq -er ".artifacts.${key}.id" "$inspect_path")"
+            sha256="$(jq -er ".artifacts.${key}.sha256" "$inspect_path")"
+            filename="$(jq -er ".artifacts.${key}.filename" "$inspect_path")"
+            [[ "$id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$sha256" =~ ^[a-f0-9]{64}$ ]]
+            [[ "$filename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            {
+              echo "${key}_id=$id"
+              echo "${key}_sha256=$sha256"
+              echo "${key}_filename=$filename"
+            } >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Verify journal-bound artifact API provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_MANIFEST_ID: ${{ steps.inspect_intent.outputs.candidate_manifest_id }}
+          CANDIDATE_MANIFEST_SHA256: ${{ steps.inspect_intent.outputs.candidate_manifest_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ steps.inspect_intent.outputs.candidate_manifest_filename }}
+          REGISTRY_ID: ${{ steps.inspect_intent.outputs.registry_id }}
+          REGISTRY_SHA256: ${{ steps.inspect_intent.outputs.registry_sha256 }}
+          REGISTRY_FILENAME: ${{ steps.inspect_intent.outputs.registry_filename }}
+          WEBSITE_ID: ${{ steps.inspect_intent.outputs.website_id }}
+          WEBSITE_SHA256: ${{ steps.inspect_intent.outputs.website_sha256 }}
+          WEBSITE_FILENAME: ${{ steps.inspect_intent.outputs.website_filename }}
+          PRODUCER_RUN_ID: ${{ steps.intent_identity.outputs.producer_run_id }}
+          PRODUCER_SOURCE_SHA: ${{ steps.inspect_intent.outputs.producer_source_sha }}
+          INTENT_ID: ${{ steps.intent_identity.outputs.artifact_id }}
+          INTENT_SHA256: ${{ steps.intent_identity.outputs.artifact_sha256 }}
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+        run: |
+          set -euo pipefail
+          run_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCER_RUN_ID}")"
+          test "$(jq -er '.id | tostring' <<< "$run_meta")" = "$PRODUCER_RUN_ID"
+          test "$(jq -er '.head_sha' <<< "$run_meta")" = "$PRODUCER_SOURCE_SHA"
+          test "$(jq -er '.repository.full_name' <<< "$run_meta")" = "$GITHUB_REPOSITORY"
+          test "$(jq -er '.head_repository.full_name' <<< "$run_meta")" = "$GITHUB_REPOSITORY"
+          test "$(jq -er '.head_branch' <<< "$run_meta")" = 'main'
+          workflow_id="$(jq -er '.workflow_id | tostring' <<< "$run_meta")"
+          workflow_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}")"
+          test "$(jq -er '.path' <<< "$workflow_meta")" = '.github/workflows/publish.yml'
+          run_path="$(jq -er '.path' <<< "$run_meta")"
+          test "${run_path%%@*}" = '.github/workflows/publish.yml'
+          producer_repository_id="$(jq -er '.repository.id | tostring' <<< "$run_meta")"
+          producer_head_repository_id="$(jq -er '.head_repository.id | tostring' <<< "$run_meta")"
+          event="$(jq -er '.event' <<< "$run_meta")"
+          [[ "$event" = 'push' || "$event" = 'workflow_dispatch' ]]
+
+          for prefix in INTENT CANDIDATE_MANIFEST REGISTRY WEBSITE; do
+            id_name="${prefix}_ID"
+            sha_name="${prefix}_SHA256"
+            filename_name="${prefix}_FILENAME"
+            id="${!id_name}"
+            sha256="${!sha_name}"
+            filename="${!filename_name}"
+            artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}")"
+            test "$(jq -er '.id | tostring' <<< "$artifact")" = "$id"
+            test "$(jq -er '.name' <<< "$artifact")" = "$filename"
+            test "$(jq -er '.expired' <<< "$artifact")" = 'false'
+            test "$(jq -er '.digest' <<< "$artifact")" = "sha256:${sha256}"
+            test "$(jq -er '.workflow_run.id | tostring' <<< "$artifact")" = "$PRODUCER_RUN_ID"
+            test "$(jq -er '.workflow_run.head_sha' <<< "$artifact")" = "$PRODUCER_SOURCE_SHA"
+            test "$(jq -er '.workflow_run.repository_id | tostring' <<< "$artifact")" = "$producer_repository_id"
+            test "$(jq -er '.workflow_run.head_repository_id | tostring' <<< "$artifact")" = "$producer_head_repository_id"
+          done
+
+      - name: Download journal-bound raw candidate manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.inspect_intent.outputs.candidate_manifest_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.intent_identity.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/intent-manifest-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download journal-bound raw registry ZIP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.inspect_intent.outputs.registry_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.intent_identity.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/intent-registry-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download journal-bound raw website ZIP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.inspect_intent.outputs.website_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.intent_identity.outputs.producer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/intent-website-input
+          skip-decompress: true
+          digest-mismatch: error
+
+      # verify-publish-intent-v2 validates the complete
+      # journal and tuple, current/backup bytes and ETags, and safely extracts to
+      # a new root. Its plan has exactly three outcomes: `cas` when current equals
+      # previous SHA+ETag, `resume` when current bytes equal candidate, otherwise
+      # it exits nonzero and emits no plan. Resume never creates another backup.
+      - name: Classify strict CAS or candidate resume from retained intent
+        id: classify
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: motrix-registry
+          R2_KEY: plugins.json
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+          INTENT_ARTIFACT_ID: ${{ steps.intent_identity.outputs.artifact_id }}
+          INTENT_ARTIFACT_SHA256: ${{ steps.intent_identity.outputs.artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ steps.inspect_intent.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_SHA256: ${{ steps.inspect_intent.outputs.candidate_manifest_sha256 }}
+          REGISTRY_FILENAME: ${{ steps.inspect_intent.outputs.registry_filename }}
+          REGISTRY_SHA256: ${{ steps.inspect_intent.outputs.registry_sha256 }}
+          WEBSITE_FILENAME: ${{ steps.inspect_intent.outputs.website_filename }}
+          WEBSITE_SHA256: ${{ steps.inspect_intent.outputs.website_sha256 }}
+        run: |
+          set -euo pipefail
+          intent_path="${RUNNER_TEMP}/retained-intent-input/${INTENT_FILENAME}"
+          manifest_path="${RUNNER_TEMP}/intent-manifest-input/${CANDIDATE_MANIFEST_FILENAME}"
+          registry_path="${RUNNER_TEMP}/intent-registry-input/${REGISTRY_FILENAME}"
+          website_path="${RUNNER_TEMP}/intent-website-input/${WEBSITE_FILENAME}"
+          test "$(sha256sum "$manifest_path" | awk '{print $1}')" = "$CANDIDATE_MANIFEST_SHA256"
+          test "$(sha256sum "$registry_path" | awk '{print $1}')" = "$REGISTRY_SHA256"
+          test "$(sha256sum "$website_path" | awk '{print $1}')" = "$WEBSITE_SHA256"
+
+          current_path="${RUNNER_TEMP}/intent-state-current.json"
+          current_meta="${RUNNER_TEMP}/intent-state-current-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$R2_KEY" \
+            "$current_path" > "$current_meta"
+          current_etag="$(jq -er '.ETag | strings | select(length > 0)' "$current_meta")"
+          backup_key="$(jq -er '.registry.backupKey' "$intent_path")"
+          backup_path="${RUNNER_TEMP}/intent-state-backup.json"
+          backup_meta="${RUNNER_TEMP}/intent-state-backup-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$backup_key" \
+            "$backup_path" > "$backup_meta"
+          backup_etag="$(jq -er '.ETag | strings | select(length > 0)' "$backup_meta")"
+
+          plan_path="${RUNNER_TEMP}/publish-intent-plan.json"
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-publish-intent-v2 \
+            "$intent_path" "$INTENT_ARTIFACT_ID" "$INTENT_ARTIFACT_SHA256" \
+            "$current_path" "$current_etag" "$backup_path" "$backup_etag" \
+            "$manifest_path" "$registry_path" "$website_path" \
+            "${RUNNER_TEMP}/promotion-intent-verified" "$plan_path"
+          mode="$(jq -er '.mode | select(. == "cas" or . == "resume")' "$plan_path")"
+          {
+            echo "mode=$mode"
+            echo "candidate_sha256=$(jq -er '.candidateSha256' "$plan_path")"
+            echo "previous_sha256=$(jq -er '.previousSha256' "$plan_path")"
+            echo "previous_etag=$(jq -er '.previousEtag' "$plan_path")"
+            echo "backup_key=$(jq -er '.backupKey' "$plan_path")"
+            echo "backup_etag=$(jq -er '.backupEtag' "$plan_path")"
+          } >> "$GITHUB_OUTPUT"
+
+      # This is the last mutable-ref check and therefore the source freeze point.
+      # A normal release requires both candidate refs to remain current. An
+      # explicit recovery requires this dispatch itself to remain current main,
+      # but deliberately does not require the journal's older source refs to be
+      # tips. Once deployment succeeds, the immutable intent must finish forward.
+      - name: Freeze current source refs before first live mutation
+        env:
+          CURRENT_REPOSITORY_TOKEN: ${{ github.token }}
+          WEBSITE_REPOSITORY_TOKEN: ${{ secrets.WEBSITE_READ_TOKEN || github.token }}
+          WEBSITE_REPOSITORY: ${{ needs.gate.outputs.website_repository }}
+          WEBSITE_REF: ${{ needs.gate.outputs.website_ref }}
+          WEBSITE_SOURCE_SHA: ${{ needs.website.outputs.website_source_sha }}
+          IS_RECOVERY: ${{ steps.intent_lookup.outputs.is_recovery }}
+        run: |
+          set -euo pipefail
+          current_main_sha="$(GH_TOKEN="$CURRENT_REPOSITORY_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "$current_main_sha" = "${{ needs.gate.outputs.registry_source_sha }}"
+          if [[ "$IS_RECOVERY" != 'true' ]]; then
+            website_ref_sha="$(GH_TOKEN="$WEBSITE_REPOSITORY_TOKEN" gh api \
+              "repos/${WEBSITE_REPOSITORY}/commits/${WEBSITE_REF}" --jq .sha)"
+            test "$website_ref_sha" = "$WEBSITE_SOURCE_SHA"
+          fi
+
+      - name: Deploy journal-bound verified website before registry transition
+        id: deploy_website
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          pnpm -C website cf:deploy:prebuilt -- \
+            --artifact-root "${RUNNER_TEMP}/promotion-intent-verified/website" \
+            --expected-registry-sha256 "${{ steps.classify.outputs.candidate_sha256 }}"
+
+      # No mutable GitHub ref is consulted after website deployment. Revalidation
+      # uses only the retained intent, exact raw artifacts, current R2 object, and
+      # immutable private backup. A normal ref advance can no longer strand a
+      # website-only release.
+      - name: Fresh immutable verification after website deployment
+        id: final_verify
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: motrix-registry
+          R2_KEY: plugins.json
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+          INTENT_ARTIFACT_ID: ${{ steps.intent_identity.outputs.artifact_id }}
+          INTENT_ARTIFACT_SHA256: ${{ steps.intent_identity.outputs.artifact_sha256 }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ steps.inspect_intent.outputs.candidate_manifest_filename }}
+          CANDIDATE_MANIFEST_SHA256: ${{ steps.inspect_intent.outputs.candidate_manifest_sha256 }}
+          REGISTRY_FILENAME: ${{ steps.inspect_intent.outputs.registry_filename }}
+          REGISTRY_SHA256: ${{ steps.inspect_intent.outputs.registry_sha256 }}
+          WEBSITE_FILENAME: ${{ steps.inspect_intent.outputs.website_filename }}
+          WEBSITE_SHA256: ${{ steps.inspect_intent.outputs.website_sha256 }}
+        run: |
+          set -euo pipefail
+          intent_path="${RUNNER_TEMP}/retained-intent-input/${INTENT_FILENAME}"
+          manifest_path="${RUNNER_TEMP}/intent-manifest-input/${CANDIDATE_MANIFEST_FILENAME}"
+          registry_path="${RUNNER_TEMP}/intent-registry-input/${REGISTRY_FILENAME}"
+          website_path="${RUNNER_TEMP}/intent-website-input/${WEBSITE_FILENAME}"
+          test "$(sha256sum "$intent_path" | awk '{print $1}')" = "$INTENT_ARTIFACT_SHA256"
+          test "$(sha256sum "$manifest_path" | awk '{print $1}')" = "$CANDIDATE_MANIFEST_SHA256"
+          test "$(sha256sum "$registry_path" | awk '{print $1}')" = "$REGISTRY_SHA256"
+          test "$(sha256sum "$website_path" | awk '{print $1}')" = "$WEBSITE_SHA256"
+
+          current_path="${RUNNER_TEMP}/final-state-current.json"
+          current_meta="${RUNNER_TEMP}/final-state-current-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$R2_KEY" \
+            "$current_path" > "$current_meta"
+          current_etag="$(jq -er '.ETag | strings | select(length > 0)' "$current_meta")"
+          backup_key="$(jq -er '.registry.backupKey' "$intent_path")"
+          backup_path="${RUNNER_TEMP}/final-state-backup.json"
+          backup_meta="${RUNNER_TEMP}/final-state-backup-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$backup_key" \
+            "$backup_path" > "$backup_meta"
+          backup_etag="$(jq -er '.ETag | strings | select(length > 0)' "$backup_meta")"
+
+          plan_path="${RUNNER_TEMP}/publish-intent-final-plan.json"
+          pnpm -C publisher exec tsx scripts/release-contract.ts verify-publish-intent-v2 \
+            "$intent_path" "$INTENT_ARTIFACT_ID" "$INTENT_ARTIFACT_SHA256" \
+            "$current_path" "$current_etag" "$backup_path" "$backup_etag" \
+            "$manifest_path" "$registry_path" "$website_path" \
+            "${RUNNER_TEMP}/promotion-intent-final-verified" "$plan_path"
+          mode="$(jq -er '.mode | select(. == "cas" or . == "resume")' "$plan_path")"
+          {
+            echo "mode=$mode"
+            echo "candidate_sha256=$(jq -er '.candidateSha256' "$plan_path")"
+            echo "previous_sha256=$(jq -er '.previousSha256' "$plan_path")"
+            echo "previous_etag=$(jq -er '.previousEtag' "$plan_path")"
+            echo "backup_key=$(jq -er '.backupKey' "$plan_path")"
+            echo "backup_etag=$(jq -er '.backupEtag' "$plan_path")"
+          } >> "$GITHUB_OUTPUT"
+
+      # `cas` performs the sole live registry write. `resume` proves that the
+      # candidate bytes are already live and skips PutObject entirely. Any third
+      # state failed in the verifier before this step.
+      - name: CAS registry or resume the exact candidate
+        id: publish_registry
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: motrix-registry
+          R2_KEY: plugins.json
+          MODE: ${{ steps.final_verify.outputs.mode }}
+          CANDIDATE_SHA256: ${{ steps.final_verify.outputs.candidate_sha256 }}
+          PREVIOUS_SHA256: ${{ steps.final_verify.outputs.previous_sha256 }}
+          PREVIOUS_ETAG: ${{ steps.final_verify.outputs.previous_etag }}
+          BACKUP_KEY: ${{ steps.final_verify.outputs.backup_key }}
+          BACKUP_ETAG: ${{ steps.final_verify.outputs.backup_etag }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" = 'cas' ]]; then
+            aws s3api put-object \
+              --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$R2_KEY" \
+              --body "${RUNNER_TEMP}/promotion-intent-final-verified/registry/plugins.json" \
+              --content-type "application/json; charset=utf-8" \
+              --if-match "$PREVIOUS_ETAG" > "${RUNNER_TEMP}/r2-live-put-meta.json"
+          elif [[ "$MODE" = 'resume' ]]; then
+            echo "candidate already live under the retained intent; skipping PutObject"
+          else
+            echo "unexpected publish transition mode: $MODE" >&2
+            exit 1
+          fi
+
+          live_verify_path="${RUNNER_TEMP}/r2-live-verify.json"
+          live_get_meta="${RUNNER_TEMP}/r2-live-get-meta.json"
+          aws s3api get-object \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$R2_KEY" \
+            "$live_verify_path" > "$live_get_meta"
+          live_etag="$(jq -er '.ETag | strings | select(length > 0)' "$live_get_meta")"
+          live_sha256="$(sha256sum "$live_verify_path" | awk '{print $1}')"
+          test "$live_sha256" = "$CANDIDATE_SHA256"
+          cmp --silent "${RUNNER_TEMP}/promotion-intent-final-verified/registry/plugins.json" "$live_verify_path"
+          if [[ "$MODE" = 'cas' ]]; then
+            put_etag="$(jq -er '.ETag | strings | select(length > 0)' "${RUNNER_TEMP}/r2-live-put-meta.json")"
+            test "$live_etag" = "$put_etag"
+          fi
+
+          {
+            echo "transition_mode=$MODE"
+            echo "previous_sha256=$PREVIOUS_SHA256"
+            echo "previous_etag=$PREVIOUS_ETAG"
+            echo "backup_key=$BACKUP_KEY"
+            echo "backup_etag=$BACKUP_ETAG"
+            echo "live_sha256=$live_sha256"
+            echo "live_etag=$live_etag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Probe cache-busted public registry bytes and ETag
+        id: live_probe
+        env:
+          EXPECTED_SHA256: ${{ steps.publish_registry.outputs.live_sha256 }}
+          EXPECTED_ETAG: ${{ steps.publish_registry.outputs.live_etag }}
+          PUBLIC_REGISTRY_URL: https://dl.motrix.app/registry/plugins.json
+        run: |
+          set -euo pipefail
+          public_body="${RUNNER_TEMP}/public-plugins.json"
+          public_headers="${RUNNER_TEMP}/public-headers.txt"
+          for probe in 1 2 3 4 5; do
+            cache_buster="run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${probe}"
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --retry 2 --retry-delay 2 --retry-max-time 60 --retry-connrefused \
+              -H 'Cache-Control: no-cache' \
+              -D "$public_headers" \
+              -o "$public_body" \
+              "${PUBLIC_REGISTRY_URL}?${cache_buster}"
+            public_sha256="$(sha256sum "$public_body" | awk '{print $1}')"
+            public_etag="$(awk 'tolower($0) ~ /^etag:/ { sub(/\r$/, ""); sub(/^[^:]+:[[:space:]]*/, ""); print; exit }' "$public_headers")"
+            if [[ "$public_sha256" = "$EXPECTED_SHA256" && "$public_etag" = "$EXPECTED_ETAG" ]]; then
+              exit 0
+            fi
+            echo "probe $probe has SHA=$public_sha256 ETag=$public_etag; waiting for exact live identity" >&2
+            sleep 10
+          done
+          echo "public registry never matched R2 SHA and ETag" >&2
+          exit 1
+
+      # complete-release-v2 derives previous/backup and the
+      # full tuple from the retained intent, binds the intent artifact id/digest,
+      # and adds only the observed live SHA/ETag and transition mode. It also runs
+      # after a failed public probe so the completed R2 state remains recoverable.
+      - name: Complete journal-bound forward release manifest
+        id: release_manifest
+        if: ${{ always() && steps.publish_registry.outcome == 'success' }}
+        env:
+          INTENT_FILENAME: ${{ steps.intent_lookup.outputs.intent_filename }}
+          INTENT_ARTIFACT_ID: ${{ steps.intent_identity.outputs.artifact_id }}
+          INTENT_ARTIFACT_SHA256: ${{ steps.intent_identity.outputs.artifact_sha256 }}
+          LIVE_SHA256: ${{ steps.publish_registry.outputs.live_sha256 }}
+          LIVE_ETAG: ${{ steps.publish_registry.outputs.live_etag }}
+          TRANSITION_MODE: ${{ steps.publish_registry.outputs.transition_mode }}
+          COMPLETION_SOURCE_SHA: ${{ github.sha }}
+          COMPLETION_EVENT: ${{ github.event_name }}
+          CANDIDATE_MANIFEST_FILENAME: ${{ steps.inspect_intent.outputs.candidate_manifest_filename }}
+          REGISTRY_FILENAME: ${{ steps.inspect_intent.outputs.registry_filename }}
+          WEBSITE_FILENAME: ${{ steps.inspect_intent.outputs.website_filename }}
+        run: |
+          set -euo pipefail
+          release_manifest_filename="registry-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          release_manifest_path="${RUNNER_TEMP}/${release_manifest_filename}"
+          pnpm -C publisher exec tsx scripts/release-contract.ts complete-release-v2 \
+            "${RUNNER_TEMP}/retained-intent-input/${INTENT_FILENAME}" \
+            "$INTENT_ARTIFACT_ID" "$INTENT_ARTIFACT_SHA256" \
+            "$LIVE_SHA256" "$LIVE_ETAG" "$TRANSITION_MODE" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$COMPLETION_SOURCE_SHA" "$COMPLETION_EVENT" \
+            "${RUNNER_TEMP}/intent-manifest-input/${CANDIDATE_MANIFEST_FILENAME}" \
+            "${RUNNER_TEMP}/intent-registry-input/${REGISTRY_FILENAME}" \
+            "${RUNNER_TEMP}/intent-website-input/${WEBSITE_FILENAME}" \
+            "$release_manifest_path"
+          pnpm -C publisher exec tsx scripts/release-contract.ts validate-release-v2 \
+            "$release_manifest_path"
+          release_manifest_sha256="$(sha256sum "$release_manifest_path" | awk '{print $1}')"
+          {
+            echo "release_manifest_filename=$release_manifest_filename"
+            echo "release_manifest_path=$release_manifest_path"
+            echo "release_manifest_sha256=$release_manifest_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Record completed release identity
+        run: |
+          {
+            echo "## Coordinated release completed"
+            echo "- Registry source: \`${{ steps.inspect_intent.outputs.producer_source_sha }}\`"
+            echo "- Registry artifact: id \`${{ steps.inspect_intent.outputs.registry_id }}\`, SHA-256 \`${{ steps.inspect_intent.outputs.registry_sha256 }}\`"
+            echo "- Live registry SHA-256: \`${{ steps.publish_registry.outputs.live_sha256 }}\`"
+            echo "- Live R2/public ETag: \`${{ steps.publish_registry.outputs.live_etag }}\`"
+            echo "- Transition: \`${{ steps.publish_registry.outputs.transition_mode }}\`"
+            echo "- Release intent: id \`${{ steps.intent_identity.outputs.artifact_id }}\`, SHA-256 \`${{ steps.intent_identity.outputs.artifact_sha256 }}\`, producer run \`${{ steps.intent_identity.outputs.producer_run_id }}\`"
+            echo "- Private backup: \`${{ steps.publish_registry.outputs.backup_key }}\` (bounded opaque previous bytes; retained as CAS-bound evidence and never parsed or restored)"
+            echo "- Website source: \`${{ steps.inspect_intent.outputs.website_source_sha }}\`"
+            echo "- Website artifact: id \`${{ steps.inspect_intent.outputs.website_id }}\`, SHA-256 \`${{ steps.inspect_intent.outputs.website_sha256 }}\`"
+            echo "- Pending raw completion manifest: \`${{ steps.release_manifest.outputs.release_manifest_filename }}\`, SHA-256 \`${{ steps.release_manifest.outputs.release_manifest_sha256 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # This upload is deliberately the final fallible success-path step. A
+      # failure leaves no trusted completion bridge; a later current-main
+      # workflow_dispatch must resume the same intent and upload a new one.
+      - name: Retain raw release manifest as the completion bridge
+        id: upload_release_manifest
+        if: ${{ always() && steps.release_manifest.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.release_manifest.outputs.release_manifest_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      # Deliberately no automatic rollback. The first registry-v2 cutover must
+      # complete forward because its opaque pre-state is not a restore target.
+      # Later releases may restore only a reviewed compatible registry-v2 tuple.
+      - name: Flag prepared website when registry flip did not complete
+        if: ${{ failure() && steps.deploy_website.outcome == 'success' && steps.publish_registry.outcome != 'success' }}
+        run: |
+          echo "::error::The journal-bound website was deployed, but the registry transition did not complete. Dispatch current main with this run's resume_operation_id; do not depend on the old source SHA remaining main."
+          {
+            echo "## Prepared website requires operator review"
+            echo "Website deployment succeeded before the registry transition. Resume operation \`${{ steps.intent_lookup.outputs.operation_id }}\` from a new current-main workflow_dispatch; do not mutate either side manually."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Flag partial-promotion risk for operator action
+        if: ${{ failure() && steps.publish_registry.outcome == 'success' }}
+        run: |
+          echo "::error::Registry transition completed but release evidence did not. Dispatch current main with resume_operation_id=${{ steps.intent_lookup.outputs.operation_id }}; the resume path must skip PutObject and finish the retained manifest."
+          {
+            echo "## Operator action required"
+            echo "The registry write completed, but a later public probe, manifest validation, or manifest retention step failed. Never roll back only one side; the initial registry-v2 cutover is forward-only."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,3479 @@
+# Production restore contract. Keep this workflow and release-contract v2 in
+# lockstep with the protected GitHub and Cloudflare configuration.
+#
+# RestoreManifestSchema/release-contract v2 requirements:
+# - manifest.from and manifest.to are complete directional release tuples.
+#   Each contains an immutable producer { repositoryId, workflowId, workflowPath,
+#   sourceSha, event }, a registry-v2 identity/artifact tuple, and a website
+#   { artifactId, artifactName, artifactSha256, runId, sourceRepository,
+#   sourceSha, distSha256, embeddedRegistryTuple }. manifest.from.registry also
+#   carries the exact outgoing live ETag; manifest.to.registry carries the
+#   immutable target sourceKey/sourceEtag. Each tuple also binds its raw
+#   candidate/registry/website artifacts, completion-manifest artifact and
+#   completion run, plus one explicit artifactSource: github or r2-operation.
+#   Unknown fields are rejected.
+# - both website embedded registry tuples equal their sibling registry tuple;
+#   from/to registry SHA-256 values are distinct;
+# - derive-restore-operation-v2 runs before source access. The workflow probes
+#   the operation's seven immutable pre-records first: intent,
+#   authorized-manifest, reverse payload, reverse registry/website ZIPs, and
+#   target registry/website ZIPs. A complete set is verified directly with
+#   verify-restore-self-v2 and never depends on GitHub or a parent operation;
+# - otherwise verify-restore-v2 accepts both raw ZIP pairs plus exactly one
+#   source proof. github proof roots contain candidate/registry/website artifact
+#   metadata, generic raw run/endpoint/workflow records, and completion artifact,
+#   manifest, attempt-specific run/endpoint, and workflow records. r2-operation
+#   proof contains one canonical direct-parent intent, completion, reverse
+#   manifest, and the four ZIPs referenced by that parent attestation;
+# - verify-restore-v2
+#   requires the registry ZIP to contain exactly one root plugins.json, requires
+#   to.plugins.json to equal the target source object byte-for-byte, validates
+#   from.plugins.json as the exact from registry-v2 SHA, binds each website bundle
+#   to its sibling registry tuple, safely fresh-extracts both websites,
+#   and atomically writes a plan, canonical intent, and authorized manifest;
+# - the plan contains stable sha256(canonical directional from/to release tuples)
+#   operationKey (including both website identities, not just registry bytes) plus
+#   deterministic keys for the seven pre-records and two post-transition records,
+#   completion.json and reverse/restore-manifest.json, plus exactly one mode:
+#     cas    = current SHA+ETag exactly equal registry.from;
+#     resume = current is valid registry-v2 and its SHA equals registry.to.sha256;
+#   every other state fails closed;
+# - verify-restore-operation-v2 binds every present pre-record independently to
+#   the manifest/plan. --allow-missing-for-cas accepts any missing subset only in
+#   cas mode; resume requires the complete seven-record set. Strict readback also
+#   requires both ZIP pairs and the reverse payload to match their tuples and the
+#   canonical persisted authorized manifest to equal the requested manifest;
+# - after transition, completion.json binds the restore workflow identity and
+#   observed target/source ETags. The deterministic reverse manifest references
+#   that completion and only its direct parent's immutable artifacts, so a later
+#   reverse remains flat and independent of GitHub retention;
+# - verify-restored-v2 accepts only registry.to as a valid registry-v2 object.
+#
+# !!! PARTIAL-STATE WARNING !!!
+# Website deployment, private R2 operation records, and the final public-registry
+# CAS cannot be atomic across services. The immutable intent and reverse backup
+# make every accepted crash state resumable and preserve a deterministic reverse
+# recovery chain; operators must retain the evidence artifact and rerun the exact
+# same manifest after any post-mutation failure.
+name: Restore registry and website
+
+'on':
+  workflow_dispatch:
+    inputs:
+      restore_manifest_json:
+        description: Strict authorized RestoreManifestSchema v2 JSON; no detached fields.
+        required: true
+        type: string
+      dry_run:
+        description: Read-only tuple verification and prebuilt Wrangler dry-run.
+        required: true
+        default: true
+        type: boolean
+
+permissions: {}
+
+# publish.yml and restore.yml must use this exact policy.
+concurrency:
+  group: registry-production
+  cancel-in-progress: false
+  # actionlint v1.7.12 predates the target queue policy.
+  queue: max
+
+env:
+  R2_BUCKET: motrix-registry
+  REGISTRY_KEY: plugins.json
+  PUBLIC_REGISTRY_URL: https://dl.motrix.app/registry/plugins.json
+  TRUSTED_PUBLISH_WORKFLOW_PATH: .github/workflows/publish.yml
+
+jobs:
+  guard:
+    name: Validate dispatch boundary
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      website_driver_repository: ${{ steps.website_driver.outputs.repository }}
+      website_driver_sha: ${{ steps.website_driver.outputs.sha }}
+    steps:
+      - name: Require main and configured website source repository
+        env:
+          WEBSITE_REPOSITORY: ${{ vars.WEBSITE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          node --input-type=module <<'NODE'
+          const repository = process.env.WEBSITE_REPOSITORY ?? ''
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+            throw new Error('vars.WEBSITE_REPOSITORY is missing or invalid')
+          }
+          NODE
+
+      # This checkout resolves main before the protected restore environment is
+      # approved. Historical release checkouts below are provenance only; this
+      # fixed current-main checkout is the sole deploy-script trust root.
+      - name: Resolve the pre-approval current-main website deploy driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.WEBSITE_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website-driver-proof
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Freeze the pre-approval website deploy-driver SHA
+        id: website_driver
+        working-directory: website-driver-proof
+        env:
+          WEBSITE_REPOSITORY: ${{ vars.WEBSITE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          DRIVER_SHA="$(git rev-parse HEAD)"
+          test "$(git rev-parse --is-inside-work-tree)" = true
+          export DRIVER_SHA
+          node --input-type=module -e "
+            if (!/^[0-9a-f]{40}$/.test(process.env.DRIVER_SHA ?? '')) process.exit(2)
+          "
+          echo "repository=$WEBSITE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "sha=$DRIVER_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the frozen deploy driver for approval review
+        env:
+          WEBSITE_REPOSITORY: ${{ steps.website_driver.outputs.repository }}
+          WEBSITE_DRIVER_SHA: ${{ steps.website_driver.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo '### Frozen website deploy driver (pre-approval)'
+            printf -- '- Repository: %s\n' "$WEBSITE_REPOSITORY"
+            printf -- '- Commit: %s\n' "$WEBSITE_DRIVER_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dry-run:
+    name: Strict read-only restore preflight
+    needs: guard
+    if: ${{ inputs.dry_run == true }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.18.0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install publisher dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Materialize and validate the one v2 restore manifest
+        id: manifest
+        env:
+          RESTORE_MANIFEST_JSON: ${{ inputs.restore_manifest_json }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/restore-contract"
+          MANIFEST="$RUNNER_TEMP/restore-contract/restore-manifest.json"
+          test ! -e "$MANIFEST"
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs'
+          const value = process.env.RESTORE_MANIFEST_JSON
+          if (!value) throw new Error('restore_manifest_json is empty')
+          writeFileSync(
+            process.env.RUNNER_TEMP + '/restore-contract/restore-manifest.json',
+            value,
+            { encoding: 'utf8', flag: 'wx', mode: 0o600 }
+          )
+          NODE
+          pnpm exec tsx scripts/release-contract.ts validate-restore-v2 "$MANIFEST"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          import { createHash } from 'node:crypto'
+          const file = process.env.RUNNER_TEMP + '/restore-contract/restore-manifest.json'
+          const bytes = readFileSync(file)
+          const manifest = JSON.parse(bytes)
+          const source = manifest.from.artifactSource
+          const values = {
+            manifest_path: file,
+            manifest_sha256: createHash('sha256').update(bytes).digest('hex'),
+            source_kind: source.kind,
+            parent_operation_key: source.parentOperationKey ?? '',
+            parent_intent_key: source.intentKey ?? '',
+            parent_intent_sha256: source.intentSha256 ?? '',
+            parent_completion_key: source.completionKey ?? '',
+            parent_completion_sha256: source.completionSha256 ?? '',
+            parent_reverse_manifest_key: source.reverseManifestKey ?? '',
+            expected_current_sha256: manifest.from.registry.sha256,
+            expected_current_etag: manifest.from.registry.etag,
+            restore_sha256: manifest.to.registry.sha256,
+            target_source_key: manifest.to.registry.sourceKey,
+            target_source_etag: manifest.to.registry.sourceEtag,
+            website_artifact_id: manifest.to.website.artifactId,
+            website_artifact_name: manifest.to.website.artifactName,
+            website_artifact_sha256: manifest.to.website.artifactSha256,
+            website_run_id: manifest.to.website.runId,
+            website_source_repository: manifest.to.website.sourceRepository,
+            website_source_sha: manifest.to.website.sourceSha,
+            website_dist_sha256: manifest.to.website.distSha256,
+            registry_artifact_id: manifest.to.registry.artifactId,
+            registry_artifact_name: manifest.to.registry.artifactName,
+            registry_artifact_sha256: manifest.to.registry.artifactSha256,
+            registry_run_id: manifest.to.registry.workflowRunId,
+            producer_repository_id: manifest.to.producer.repositoryId,
+            producer_workflow_id: manifest.to.producer.workflowId,
+            producer_source_sha: manifest.to.producer.sourceSha,
+            candidate_artifact_id: manifest.to.candidateManifestArtifact.artifactId,
+            candidate_artifact_name: manifest.to.candidateManifestArtifact.artifactName,
+            candidate_artifact_sha256: manifest.to.candidateManifestArtifact.artifactSha256,
+            completion_artifact_id: manifest.to.completion.artifactId,
+            completion_artifact_name: manifest.to.completion.artifactName,
+            completion_artifact_sha256: manifest.to.completion.artifactSha256,
+            completion_manifest_sha256: manifest.to.completion.manifestSha256,
+            completion_run_id: manifest.to.completion.runId,
+            completion_run_attempt: manifest.to.completion.runAttempt,
+            completion_source_sha: manifest.to.completion.sourceSha,
+            completion_event: manifest.to.completion.event,
+            target_registry_source_artifact_key: manifest.to.artifactSource.registryArtifactKey ?? '',
+            target_website_source_artifact_key: manifest.to.artifactSource.websiteArtifactKey ?? '',
+            from_website_artifact_id: manifest.from.website.artifactId,
+            from_website_artifact_name: manifest.from.website.artifactName,
+            from_website_artifact_sha256: manifest.from.website.artifactSha256,
+            from_website_run_id: manifest.from.website.runId,
+            from_website_source_repository: manifest.from.website.sourceRepository,
+            from_website_source_sha: manifest.from.website.sourceSha,
+            from_website_dist_sha256: manifest.from.website.distSha256,
+            from_registry_artifact_id: manifest.from.registry.artifactId,
+            from_registry_artifact_name: manifest.from.registry.artifactName,
+            from_registry_artifact_sha256: manifest.from.registry.artifactSha256,
+            from_registry_run_id: manifest.from.registry.workflowRunId,
+            from_producer_repository_id: manifest.from.producer.repositoryId,
+            from_producer_workflow_id: manifest.from.producer.workflowId,
+            from_producer_source_sha: manifest.from.producer.sourceSha,
+            from_candidate_artifact_id: manifest.from.candidateManifestArtifact.artifactId,
+            from_candidate_artifact_name: manifest.from.candidateManifestArtifact.artifactName,
+            from_candidate_artifact_sha256: manifest.from.candidateManifestArtifact.artifactSha256,
+            from_completion_artifact_id: manifest.from.completion.artifactId,
+            from_completion_artifact_name: manifest.from.completion.artifactName,
+            from_completion_artifact_sha256: manifest.from.completion.artifactSha256,
+            from_completion_manifest_sha256: manifest.from.completion.manifestSha256,
+            from_completion_run_id: manifest.from.completion.runId,
+            from_completion_run_attempt: manifest.from.completion.runAttempt,
+            from_completion_source_sha: manifest.from.completion.sourceSha,
+            from_completion_event: manifest.from.completion.event,
+            from_registry_source_artifact_key: manifest.from.artifactSource.registryArtifactKey ?? '',
+            from_website_source_artifact_key: manifest.from.artifactSource.websiteArtifactKey ?? ''
+          }
+          for (const [key, value] of Object.entries(values)) {
+            appendFileSync(process.env.GITHUB_OUTPUT, key + '=' + value + '\n')
+          }
+          NODE
+
+      - name: Derive the deterministic operation prefix before source access
+        id: derived
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          DERIVED="$RUNNER_TEMP/restore-contract/derived-operation.json"
+          test ! -e "$DERIVED"
+          pnpm exec tsx scripts/release-contract.ts derive-restore-operation-v2 \
+            "$MANIFEST" "$DERIVED"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const value = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP + '/restore-contract/derived-operation.json',
+            'utf8'
+          ))
+          if (!/^[0-9a-f]{64}$/.test(value.operationKey ?? '')) {
+            throw new Error('derived operation key is invalid')
+          }
+          const names = [
+            'intentKey',
+            'authorizedManifestKey',
+            'reverseRegistryPayloadKey',
+            'reverseRegistryArtifactKey',
+            'reverseWebsiteArtifactKey',
+            'targetRegistryArtifactKey',
+            'targetWebsiteArtifactKey',
+            'completionKey',
+            'reverseManifestKey'
+          ]
+          appendFileSync(process.env.GITHUB_OUTPUT, 'operation_key=' + value.operationKey + '\n')
+          for (const name of names) {
+            if (typeof value.objects?.[name] !== 'string') {
+              throw new Error('derived operation object key is missing: ' + name)
+            }
+            const output = name.replace(/[A-Z]/g, letter => '_' + letter.toLowerCase())
+            appendFileSync(process.env.GITHUB_OUTPUT, output + '=' + value.objects[name] + '\n')
+          }
+          NODE
+
+      - name: Read live registry and probe this operation first
+        id: own_probe
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          INTENT_KEY: ${{ steps.derived.outputs.intent_key }}
+          AUTHORIZED_MANIFEST_KEY: ${{ steps.derived.outputs.authorized_manifest_key }}
+          REVERSE_REGISTRY_PAYLOAD_KEY: ${{ steps.derived.outputs.reverse_registry_payload_key }}
+          REVERSE_REGISTRY_ARTIFACT_KEY: ${{ steps.derived.outputs.reverse_registry_artifact_key }}
+          REVERSE_WEBSITE_ARTIFACT_KEY: ${{ steps.derived.outputs.reverse_website_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.derived.outputs.target_registry_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.derived.outputs.target_website_artifact_key }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 \
+            "$RUNNER_TEMP/live-registry" \
+            "$RUNNER_TEMP/self-proof/reverse" \
+            "$RUNNER_TEMP/self-proof/target" \
+            "$RUNNER_TEMP/self-probe-meta"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            > "$RUNNER_TEMP/live-registry/get.meta.json"
+          read_optional() {
+            key="$1"
+            destination="$2"
+            label="$3"
+            if aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" --key "$key" "$destination" \
+              > "$RUNNER_TEMP/self-probe-meta/$label.meta.json" \
+              2> "$RUNNER_TEMP/self-probe-meta/$label.error"; then
+              echo "$label=true" >> "$GITHUB_OUTPUT"
+            elif grep -Eq 'NoSuchKey|Not Found|404' \
+              "$RUNNER_TEMP/self-probe-meta/$label.error"; then
+              rm -f "$destination"
+              echo "$label=false" >> "$GITHUB_OUTPUT"
+            else
+              sed -n '1,80p' "$RUNNER_TEMP/self-probe-meta/$label.error" >&2
+              return 1
+            fi
+          }
+          read_optional "$INTENT_KEY" "$RUNNER_TEMP/self-proof/intent.json" intent_exists
+          read_optional "$AUTHORIZED_MANIFEST_KEY" \
+            "$RUNNER_TEMP/self-proof/authorized-manifest.json" authorized_manifest_exists
+          read_optional "$REVERSE_REGISTRY_PAYLOAD_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/plugins.json" reverse_registry_payload_exists
+          read_optional "$REVERSE_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/registry.zip" reverse_registry_artifact_exists
+          read_optional "$REVERSE_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/website.zip" reverse_website_artifact_exists
+          read_optional "$TARGET_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/target/registry.zip" target_registry_artifact_exists
+          read_optional "$TARGET_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/target/website.zip" target_website_artifact_exists
+          PRESENT_COUNT="$(grep -c '=true$' "$GITHUB_OUTPUT" || true)"
+          case "$PRESENT_COUNT" in
+            0) state=empty ;;
+            7) state=full ;;
+            *) state=partial ;;
+          esac
+          CURRENT_ETAG="$(jq -er '.ETag | strings | select(length > 0)' \
+            "$RUNNER_TEMP/live-registry/get.meta.json")"
+          {
+            echo "state=$state"
+            echo "present_count=$PRESENT_COUNT"
+            echo "current_etag=$CURRENT_ETAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify a complete self journal before any external source lookup
+        if: ${{ steps.own_probe.outputs.state == 'full' }}
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          VERIFY_ROOT="$RUNNER_TEMP/verified-restore-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          PLAN="$RUNNER_TEMP/restore-contract/read-only-plan.json"
+          test ! -e "$VERIFY_ROOT"
+          test ! -e "$PLAN"
+          pnpm exec tsx scripts/release-contract.ts verify-restore-self-v2 \
+            "$MANIFEST" \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            "$RUNNER_TEMP/self-proof" \
+            "$CURRENT_ETAG" "$VERIFY_ROOT" "$PLAN"
+
+      - name: Verify both artifacts belong to one trusted publish run
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          WEBSITE_ARTIFACT_ID: ${{ steps.manifest.outputs.website_artifact_id }}
+          WEBSITE_ARTIFACT_NAME: ${{ steps.manifest.outputs.website_artifact_name }}
+          WEBSITE_ARTIFACT_SHA256: ${{ steps.manifest.outputs.website_artifact_sha256 }}
+          WEBSITE_RUN_ID: ${{ steps.manifest.outputs.website_run_id }}
+          REGISTRY_ARTIFACT_ID: ${{ steps.manifest.outputs.registry_artifact_id }}
+          REGISTRY_ARTIFACT_NAME: ${{ steps.manifest.outputs.registry_artifact_name }}
+          REGISTRY_ARTIFACT_SHA256: ${{ steps.manifest.outputs.registry_artifact_sha256 }}
+          REGISTRY_RUN_ID: ${{ steps.manifest.outputs.registry_run_id }}
+          MANIFEST_PRODUCER_REPOSITORY_ID: ${{ steps.manifest.outputs.producer_repository_id }}
+          MANIFEST_PRODUCER_WORKFLOW_ID: ${{ steps.manifest.outputs.producer_workflow_id }}
+          MANIFEST_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.producer_source_sha }}
+          COMPLETION_RUN_ID: ${{ steps.manifest.outputs.completion_run_id }}
+          COMPLETION_RUN_ATTEMPT: ${{ steps.manifest.outputs.completion_run_attempt }}
+          COMPLETION_SOURCE_SHA: ${{ steps.manifest.outputs.completion_source_sha }}
+          COMPLETION_EVENT: ${{ steps.manifest.outputs.completion_event }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          install -d -m 0700 "$RUNNER_TEMP/github-provenance"
+          gh api "repos/$REPOSITORY/actions/artifacts/$WEBSITE_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/website-artifact.json"
+          gh api "repos/$REPOSITORY/actions/artifacts/$REGISTRY_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/registry-artifact.json"
+          gh api "repos/$REPOSITORY/actions/runs/$WEBSITE_RUN_ID" \
+            > "$RUNNER_TEMP/github-provenance/run.json"
+          WORKFLOW_ID="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const value = JSON.parse(readFileSync(
+              process.env.RUNNER_TEMP + '/github-provenance/run.json', 'utf8'
+            )).workflow_id
+            if (!Number.isSafeInteger(value)) process.exit(2)
+            process.stdout.write(String(value))
+          ")"
+          gh api "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID" \
+            > "$RUNNER_TEMP/github-provenance/workflow.json"
+          gh api "repos/$REPOSITORY/actions/runs/$COMPLETION_RUN_ID/attempts/$COMPLETION_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/github-provenance/completion-run.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/github-provenance/'
+          const website = JSON.parse(readFileSync(root + 'website-artifact.json', 'utf8'))
+          const registry = JSON.parse(readFileSync(root + 'registry-artifact.json', 'utf8'))
+          const run = JSON.parse(readFileSync(root + 'run.json', 'utf8'))
+          const workflow = JSON.parse(readFileSync(root + 'workflow.json', 'utf8'))
+          const completion = JSON.parse(readFileSync(root + 'completion-run.json', 'utf8'))
+          const sameId = (actual, expected, label) => {
+            if (String(actual) !== expected) throw new Error(label + ' mismatch')
+          }
+          const bindArtifactRun = (artifact, label) => {
+            const producer = artifact.workflow_run
+            sameId(producer?.id, String(run.id), label + ' run id')
+            sameId(producer?.repository_id, String(run.repository?.id), label + ' repository id')
+            sameId(
+              producer?.head_repository_id,
+              String(run.head_repository?.id),
+              label + ' head repository id'
+            )
+            if (producer?.head_branch !== run.head_branch) {
+              throw new Error(label + ' head branch mismatch')
+            }
+            if (producer?.head_sha !== run.head_sha) {
+              throw new Error(label + ' head SHA mismatch')
+            }
+          }
+          sameId(website.id, process.env.WEBSITE_ARTIFACT_ID, 'website artifact id')
+          sameId(registry.id, process.env.REGISTRY_ARTIFACT_ID, 'registry artifact id')
+          if (website.name !== process.env.WEBSITE_ARTIFACT_NAME ||
+              registry.name !== process.env.REGISTRY_ARTIFACT_NAME) {
+            throw new Error('artifact name mismatch')
+          }
+          if (process.env.WEBSITE_ARTIFACT_ID === process.env.REGISTRY_ARTIFACT_ID) {
+            throw new Error('website and registry artifact ids must differ')
+          }
+          if (website.expired !== false || registry.expired !== false) {
+            throw new Error('restore artifact is expired')
+          }
+          if (website.digest !== 'sha256:' + process.env.WEBSITE_ARTIFACT_SHA256) {
+            throw new Error('website artifact server digest mismatch')
+          }
+          if (registry.digest !== 'sha256:' + process.env.REGISTRY_ARTIFACT_SHA256) {
+            throw new Error('registry artifact server digest mismatch')
+          }
+          if (process.env.WEBSITE_RUN_ID !== process.env.REGISTRY_RUN_ID) {
+            throw new Error('embedded tuple does not identify one publish run')
+          }
+          sameId(run.id, process.env.WEBSITE_RUN_ID, 'publish run id')
+          sameId(run.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'publish repository id')
+          sameId(
+            run.repository?.id,
+            process.env.MANIFEST_PRODUCER_REPOSITORY_ID,
+            'manifest producer repository id'
+          )
+          sameId(run.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'publish head repository id')
+          if (run.repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('publish run repository mismatch')
+          }
+          if (run.head_repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('publish run head repository mismatch')
+          }
+          sameId(workflow.id, String(run.workflow_id), 'producer workflow id')
+          sameId(workflow.id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'manifest workflow id')
+          if (workflow.path !== process.env.TRUSTED_PUBLISH_WORKFLOW_PATH) {
+            throw new Error('unexpected producer workflow endpoint path')
+          }
+          const allowedRunPaths = [
+            workflow.path,
+            workflow.path + '@main',
+            workflow.path + '@refs/heads/main'
+          ]
+          if (!allowedRunPaths.includes(String(run.path ?? ''))) {
+            throw new Error('run path does not cross-check with workflow endpoint')
+          }
+          if (!['push', 'workflow_dispatch'].includes(run.event)) {
+            throw new Error('unexpected producer event')
+          }
+          if (run.head_branch !== 'main') throw new Error('producer head branch is not main')
+          const completedConclusions = new Set([
+            'success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out',
+            'action_required', 'stale', 'startup_failure'
+          ])
+          if (run.status !== 'completed' || !completedConclusions.has(run.conclusion)) {
+            throw new Error('producer run has no completed GitHub conclusion')
+          }
+          if (run.conclusion !== 'success') {
+            sameId(completion.id, process.env.COMPLETION_RUN_ID, 'completion run id')
+            sameId(completion.run_attempt, process.env.COMPLETION_RUN_ATTEMPT, 'completion run attempt')
+            sameId(completion.workflow_id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'completion workflow id')
+            sameId(completion.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'completion repository id')
+            sameId(completion.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'completion head repository id')
+            if (completion.repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_sha !== process.env.COMPLETION_SOURCE_SHA ||
+                completion.head_branch !== 'main' ||
+                completion.event !== 'workflow_dispatch' ||
+                process.env.COMPLETION_EVENT !== 'workflow_dispatch' ||
+                completion.status !== 'completed' || completion.conclusion !== 'success' ||
+                !allowedRunPaths.includes(String(completion.path ?? ''))) {
+              throw new Error('failed producer has no successful attempt-specific completion bridge')
+            }
+          }
+          if (!/^[0-9a-f]{40}$/.test(run.head_sha ?? '')) {
+            throw new Error('producer head SHA is invalid')
+          }
+          if (run.head_sha !== process.env.MANIFEST_PRODUCER_SOURCE_SHA) {
+            throw new Error('producer head SHA differs from the manifest')
+          }
+          bindArtifactRun(website, 'website artifact')
+          bindArtifactRun(registry, 'registry artifact')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'producer_head_sha=' + run.head_sha + '\n')
+          NODE
+
+      - name: Verify the outgoing release artifacts and trusted publish run
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: from_provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          WEBSITE_ARTIFACT_ID: ${{ steps.manifest.outputs.from_website_artifact_id }}
+          WEBSITE_ARTIFACT_NAME: ${{ steps.manifest.outputs.from_website_artifact_name }}
+          WEBSITE_ARTIFACT_SHA256: ${{ steps.manifest.outputs.from_website_artifact_sha256 }}
+          WEBSITE_RUN_ID: ${{ steps.manifest.outputs.from_website_run_id }}
+          REGISTRY_ARTIFACT_ID: ${{ steps.manifest.outputs.from_registry_artifact_id }}
+          REGISTRY_ARTIFACT_NAME: ${{ steps.manifest.outputs.from_registry_artifact_name }}
+          REGISTRY_ARTIFACT_SHA256: ${{ steps.manifest.outputs.from_registry_artifact_sha256 }}
+          REGISTRY_RUN_ID: ${{ steps.manifest.outputs.from_registry_run_id }}
+          MANIFEST_PRODUCER_REPOSITORY_ID: ${{ steps.manifest.outputs.from_producer_repository_id }}
+          MANIFEST_PRODUCER_WORKFLOW_ID: ${{ steps.manifest.outputs.from_producer_workflow_id }}
+          MANIFEST_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.from_producer_source_sha }}
+          COMPLETION_RUN_ID: ${{ steps.manifest.outputs.from_completion_run_id }}
+          COMPLETION_RUN_ATTEMPT: ${{ steps.manifest.outputs.from_completion_run_attempt }}
+          COMPLETION_SOURCE_SHA: ${{ steps.manifest.outputs.from_completion_source_sha }}
+          COMPLETION_EVENT: ${{ steps.manifest.outputs.from_completion_event }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/actions/artifacts/$WEBSITE_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-website-artifact.json"
+          gh api "repos/$REPOSITORY/actions/artifacts/$REGISTRY_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-registry-artifact.json"
+          gh api "repos/$REPOSITORY/actions/runs/$WEBSITE_RUN_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-run.json"
+          WORKFLOW_ID="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const value = JSON.parse(readFileSync(
+              process.env.RUNNER_TEMP + '/github-provenance/from-run.json', 'utf8'
+            )).workflow_id
+            if (!Number.isSafeInteger(value)) process.exit(2)
+            process.stdout.write(String(value))
+          ")"
+          gh api "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-workflow.json"
+          gh api "repos/$REPOSITORY/actions/runs/$COMPLETION_RUN_ID/attempts/$COMPLETION_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/github-provenance/from-completion-run.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/github-provenance/from-'
+          const website = JSON.parse(readFileSync(root + 'website-artifact.json', 'utf8'))
+          const registry = JSON.parse(readFileSync(root + 'registry-artifact.json', 'utf8'))
+          const run = JSON.parse(readFileSync(root + 'run.json', 'utf8'))
+          const workflow = JSON.parse(readFileSync(root + 'workflow.json', 'utf8'))
+          const completion = JSON.parse(readFileSync(root + 'completion-run.json', 'utf8'))
+          const sameId = (actual, expected, label) => {
+            if (String(actual) !== expected) throw new Error(label + ' mismatch')
+          }
+          const bind = (artifact, label) => {
+            sameId(artifact.workflow_run?.id, String(run.id), label + ' run id')
+            sameId(artifact.workflow_run?.repository_id, String(run.repository?.id), label + ' repository id')
+            sameId(
+              artifact.workflow_run?.head_repository_id,
+              String(run.head_repository?.id),
+              label + ' head repository id'
+            )
+            if (artifact.workflow_run?.head_branch !== run.head_branch ||
+                artifact.workflow_run?.head_sha !== run.head_sha) {
+              throw new Error(label + ' immutable run identity mismatch')
+            }
+          }
+          sameId(website.id, process.env.WEBSITE_ARTIFACT_ID, 'from website artifact id')
+          sameId(registry.id, process.env.REGISTRY_ARTIFACT_ID, 'from registry artifact id')
+          if (website.name !== process.env.WEBSITE_ARTIFACT_NAME ||
+              registry.name !== process.env.REGISTRY_ARTIFACT_NAME) {
+            throw new Error('from artifact name mismatch')
+          }
+          if (website.expired !== false || registry.expired !== false) {
+            throw new Error('from artifact is expired')
+          }
+          if (website.digest !== 'sha256:' + process.env.WEBSITE_ARTIFACT_SHA256 ||
+              registry.digest !== 'sha256:' + process.env.REGISTRY_ARTIFACT_SHA256) {
+            throw new Error('from artifact server digest mismatch')
+          }
+          if (process.env.WEBSITE_RUN_ID !== process.env.REGISTRY_RUN_ID) {
+            throw new Error('from release artifacts do not share one run')
+          }
+          sameId(run.id, process.env.WEBSITE_RUN_ID, 'from publish run id')
+          sameId(run.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from repository id')
+          sameId(run.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from head repository id')
+          sameId(run.repository?.id, process.env.MANIFEST_PRODUCER_REPOSITORY_ID, 'from manifest repository id')
+          sameId(workflow.id, String(run.workflow_id), 'from workflow id')
+          sameId(workflow.id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'from manifest workflow id')
+          if (run.repository?.full_name !== process.env.REPOSITORY ||
+              run.head_repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('from producer repository mismatch')
+          }
+          if (workflow.path !== process.env.TRUSTED_PUBLISH_WORKFLOW_PATH) {
+            throw new Error('from workflow endpoint path is not trusted')
+          }
+          const allowedRunPaths = [
+            workflow.path,
+            workflow.path + '@main',
+            workflow.path + '@refs/heads/main'
+          ]
+          if (!allowedRunPaths.includes(String(run.path ?? ''))) {
+            throw new Error('from run path cross-check failed')
+          }
+          const completedConclusions = new Set([
+            'success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out',
+            'action_required', 'stale', 'startup_failure'
+          ])
+          if (!['push', 'workflow_dispatch'].includes(run.event) ||
+              run.head_branch !== 'main' || run.status !== 'completed' ||
+              !completedConclusions.has(run.conclusion)) {
+            throw new Error('from producer run policy mismatch')
+          }
+          if (run.conclusion !== 'success') {
+            sameId(completion.id, process.env.COMPLETION_RUN_ID, 'from completion run id')
+            sameId(completion.run_attempt, process.env.COMPLETION_RUN_ATTEMPT, 'from completion run attempt')
+            sameId(completion.workflow_id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'from completion workflow id')
+            sameId(completion.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from completion repository id')
+            sameId(completion.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from completion head repository id')
+            if (completion.repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_sha !== process.env.COMPLETION_SOURCE_SHA ||
+                completion.head_branch !== 'main' ||
+                completion.event !== 'workflow_dispatch' ||
+                process.env.COMPLETION_EVENT !== 'workflow_dispatch' ||
+                completion.status !== 'completed' || completion.conclusion !== 'success' ||
+                !allowedRunPaths.includes(String(completion.path ?? ''))) {
+              throw new Error('failed from producer has no successful attempt-specific completion bridge')
+            }
+          }
+          if (run.head_sha !== process.env.MANIFEST_PRODUCER_SOURCE_SHA) {
+            throw new Error('from producer source SHA mismatch')
+          }
+          bind(website, 'from website artifact')
+          bind(registry, 'from registry artifact')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'producer_head_sha=' + run.head_sha + '\n')
+          NODE
+
+      - name: Download the one raw website ZIP from this repository
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.website_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.website_run_id }}
+          path: ${{ runner.temp }}/website-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download the one raw registry ZIP from this repository
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.registry_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.registry_run_id }}
+          path: ${{ runner.temp }}/registry-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing raw website ZIP for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_website_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_website_run_id }}
+          path: ${{ runner.temp }}/from-website-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing raw registry ZIP for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_registry_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_registry_run_id }}
+          path: ${{ runner.temp }}/from-registry-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download target release completion manifest
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.completion_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.completion_run_id }}
+          path: ${{ runner.temp }}/completion-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing release completion manifest
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_completion_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_completion_run_id }}
+          path: ${{ runner.temp }}/from-completion-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Materialize complete strict GitHub proof roots
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          install -d -m 0700 "$RUNNER_TEMP/source-proof/from" "$RUNNER_TEMP/source-proof/to"
+          fetch_tuple() {
+            side="$1"
+            root="$RUNNER_TEMP/source-proof/$side"
+            candidate_id="$(jq -er ".$side.candidateManifestArtifact.artifactId" "$MANIFEST")"
+            registry_id="$(jq -er ".$side.registry.artifactId" "$MANIFEST")"
+            website_id="$(jq -er ".$side.website.artifactId" "$MANIFEST")"
+            raw_run_id="$(jq -er ".$side.registry.workflowRunId" "$MANIFEST")"
+            workflow_id="$(jq -er ".$side.producer.workflowId" "$MANIFEST")"
+            completion_id="$(jq -er ".$side.completion.artifactId" "$MANIFEST")"
+            completion_run_id="$(jq -er ".$side.completion.runId" "$MANIFEST")"
+            completion_attempt="$(jq -er ".$side.completion.runAttempt" "$MANIFEST")"
+            raw_endpoint="https://api.github.com/repos/$REPOSITORY/actions/runs/$raw_run_id"
+            completion_endpoint="https://api.github.com/repos/$REPOSITORY/actions/runs/$completion_run_id/attempts/$completion_attempt"
+            gh api "repos/$REPOSITORY/actions/artifacts/$candidate_id" > "$root/candidate-artifact.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$registry_id" > "$root/registry-artifact.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$website_id" > "$root/website-artifact.json"
+            gh api "repos/$REPOSITORY/actions/runs/$raw_run_id" > "$root/raw-run.json"
+            jq -n --arg url "$raw_endpoint" '{url: $url}' > "$root/raw-run-endpoint.json"
+            gh api "repos/$REPOSITORY/actions/workflows/$workflow_id" > "$root/raw-workflow.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$completion_id" > "$root/completion-artifact.json"
+            gh api "repos/$REPOSITORY/actions/runs/$completion_run_id/attempts/$completion_attempt" \
+              > "$root/completion-run.json"
+            jq -n --arg url "$completion_endpoint" '{url: $url}' \
+              > "$root/completion-run-endpoint.json"
+            gh api "repos/$REPOSITORY/actions/workflows/$workflow_id" \
+              > "$root/completion-workflow.json"
+          }
+          fetch_tuple from
+          fetch_tuple to
+          node --input-type=module <<'NODE'
+          import { lstatSync, readdirSync, renameSync } from 'node:fs'
+          import path from 'node:path'
+          function moveOne(side, directory) {
+            const source = path.join(process.env.RUNNER_TEMP, directory)
+            const names = readdirSync(source)
+            if (names.length !== 1) {
+              throw new Error(side + ' completion download must contain exactly one file')
+            }
+            const file = path.join(source, names[0])
+            const stat = lstatSync(file)
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+              throw new Error(side + ' completion manifest is not a regular file')
+            }
+            renameSync(
+              file,
+              path.join(process.env.RUNNER_TEMP, 'source-proof', side, 'release-manifest.json')
+            )
+          }
+          moveOne('from', 'from-completion-artifact')
+          moveOne('to', 'completion-artifact')
+          NODE
+
+      - name: Resolve exactly one downloaded regular ZIP
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: website_zip
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          const root = process.env.RUNNER_TEMP + '/website-artifact'
+          const names = readdirSync(root)
+          if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+            throw new Error('artifact download must contain exactly one ZIP')
+          }
+          const file = path.join(root, names[0])
+          const stat = lstatSync(file)
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error('downloaded website ZIP is not a real regular file')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'path=' + file + '\n')
+          NODE
+
+      - name: Resolve exactly one downloaded regular registry ZIP
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: registry_zip
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          const root = process.env.RUNNER_TEMP + '/registry-artifact'
+          const names = readdirSync(root)
+          if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+            throw new Error('registry artifact download must contain exactly one ZIP')
+          }
+          const file = path.join(root, names[0])
+          const stat = lstatSync(file)
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error('downloaded registry ZIP is not a real regular file')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'path=' + file + '\n')
+          NODE
+
+      - name: Resolve both outgoing raw ZIPs for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: from_zips
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          function oneZip(directory, label) {
+            const names = readdirSync(directory)
+            if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+              throw new Error(label + ' must contain exactly one ZIP')
+            }
+            const file = path.join(directory, names[0])
+            const stat = lstatSync(file)
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+              throw new Error(label + ' ZIP is not a real regular file')
+            }
+            return file
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'website_path=' + oneZip(
+              process.env.RUNNER_TEMP + '/from-website-artifact',
+              'outgoing website artifact'
+            ) + '\n'
+          )
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'registry_path=' + oneZip(
+              process.env.RUNNER_TEMP + '/from-registry-artifact',
+              'outgoing registry artifact'
+            ) + '\n'
+          )
+          NODE
+
+      - name: Read current and backup objects with read-only R2 credentials
+        id: r2
+        if: ${{ steps.own_probe.outputs.state != 'full' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          BACKUP_KEY: ${{ steps.manifest.outputs.target_source_key }}
+          OWN_CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 "$RUNNER_TEMP/restore-inputs"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/restore-inputs/current.json" \
+            > "$RUNNER_TEMP/restore-inputs/current.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$BACKUP_KEY" \
+            "$RUNNER_TEMP/restore-inputs/backup.json" \
+            > "$RUNNER_TEMP/restore-inputs/backup.meta.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          function etag(name) {
+            const value = JSON.parse(
+              readFileSync(process.env.RUNNER_TEMP + '/restore-inputs/' + name + '.meta.json', 'utf8')
+            ).ETag
+            if (typeof value !== 'string' || value.length === 0) {
+              throw new Error(name + ' ETag is missing')
+            }
+            return value
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_etag=' + etag('current') + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'backup_etag=' + etag('backup') + '\n')
+          NODE
+          cmp --silent \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            "$RUNNER_TEMP/restore-inputs/current.json"
+          test "$(jq -er '.ETag | strings | select(length > 0)' \
+            "$RUNNER_TEMP/restore-inputs/current.meta.json")" = "$OWN_CURRENT_ETAG"
+
+      - name: Fetch direct-parent R2 attestation and referenced ZIPs
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'r2-operation' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PARENT_INTENT_KEY: ${{ steps.manifest.outputs.parent_intent_key }}
+          PARENT_COMPLETION_KEY: ${{ steps.manifest.outputs.parent_completion_key }}
+          PARENT_REVERSE_MANIFEST_KEY: ${{ steps.manifest.outputs.parent_reverse_manifest_key }}
+          FROM_REGISTRY_ARTIFACT_KEY: ${{ steps.manifest.outputs.from_registry_source_artifact_key }}
+          FROM_WEBSITE_ARTIFACT_KEY: ${{ steps.manifest.outputs.from_website_source_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.manifest.outputs.target_registry_source_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.manifest.outputs.target_website_source_artifact_key }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$PARENT_INTENT_KEY"
+          test -n "$PARENT_COMPLETION_KEY"
+          test -n "$PARENT_REVERSE_MANIFEST_KEY"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 \
+            "$RUNNER_TEMP/source-proof" \
+            "$RUNNER_TEMP/r2-parent-artifacts" \
+            "$RUNNER_TEMP/r2-parent-meta"
+          get_parent() {
+            key="$1"
+            destination="$2"
+            label="$3"
+            aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" --key "$key" "$destination" \
+              > "$RUNNER_TEMP/r2-parent-meta/$label.meta.json"
+          }
+          get_parent "$PARENT_INTENT_KEY" "$RUNNER_TEMP/source-proof/intent.json" parent-intent
+          get_parent "$PARENT_COMPLETION_KEY" "$RUNNER_TEMP/source-proof/completion.json" parent-completion
+          get_parent "$PARENT_REVERSE_MANIFEST_KEY" \
+            "$RUNNER_TEMP/source-proof/reverse-manifest.json" parent-reverse-manifest
+          get_parent "$FROM_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/from-registry.zip" from-registry
+          get_parent "$FROM_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/from-website.zip" from-website
+          get_parent "$TARGET_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/to-registry.zip" to-registry
+          get_parent "$TARGET_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/to-website.zip" to-website
+
+      - name: Strictly verify tuple, classify state, and fresh-extract
+        id: plan
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          SOURCE_KIND: ${{ steps.manifest.outputs.source_kind }}
+          OWN_RECORD_STATE: ${{ steps.own_probe.outputs.state }}
+          WEBSITE_ZIP: ${{ steps.website_zip.outputs.path }}
+          REGISTRY_ZIP: ${{ steps.registry_zip.outputs.path }}
+          FROM_WEBSITE_ZIP: ${{ steps.from_zips.outputs.website_path }}
+          FROM_REGISTRY_ZIP: ${{ steps.from_zips.outputs.registry_path }}
+          CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+          BACKUP_ETAG: ${{ steps.r2.outputs.backup_etag }}
+        run: |
+          set -euo pipefail
+          VERIFY_ROOT="$RUNNER_TEMP/verified-restore-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          PLAN="$RUNNER_TEMP/restore-contract/read-only-plan.json"
+          INTENT="$RUNNER_TEMP/restore-contract/read-only-intent.json"
+          AUTHORIZED="$RUNNER_TEMP/restore-contract/read-only-authorized-manifest.json"
+          if test "$OWN_RECORD_STATE" != full; then
+            if test "$SOURCE_KIND" = github; then
+              TARGET_WEBSITE_ZIP="$WEBSITE_ZIP"
+              TARGET_REGISTRY_ZIP="$REGISTRY_ZIP"
+              OUTGOING_WEBSITE_ZIP="$FROM_WEBSITE_ZIP"
+              OUTGOING_REGISTRY_ZIP="$FROM_REGISTRY_ZIP"
+            else
+              test "$SOURCE_KIND" = r2-operation
+              TARGET_WEBSITE_ZIP="$RUNNER_TEMP/r2-parent-artifacts/to-website.zip"
+              TARGET_REGISTRY_ZIP="$RUNNER_TEMP/r2-parent-artifacts/to-registry.zip"
+              OUTGOING_WEBSITE_ZIP="$RUNNER_TEMP/r2-parent-artifacts/from-website.zip"
+              OUTGOING_REGISTRY_ZIP="$RUNNER_TEMP/r2-parent-artifacts/from-registry.zip"
+            fi
+            EXISTING_INTENT=-
+            if test -f "$RUNNER_TEMP/self-proof/intent.json"; then
+              EXISTING_INTENT="$RUNNER_TEMP/self-proof/intent.json"
+            fi
+            test ! -e "$VERIFY_ROOT"
+            test ! -e "$PLAN"
+            test ! -e "$INTENT"
+            test ! -e "$AUTHORIZED"
+            pnpm exec tsx scripts/release-contract.ts verify-restore-v2 \
+              "$MANIFEST" \
+              "$RUNNER_TEMP/live-registry/plugins.json" \
+              "$RUNNER_TEMP/restore-inputs/backup.json" \
+              "$TARGET_WEBSITE_ZIP" "$TARGET_REGISTRY_ZIP" \
+              "$OUTGOING_WEBSITE_ZIP" "$OUTGOING_REGISTRY_ZIP" \
+              "$RUNNER_TEMP/source-proof" "$EXISTING_INTENT" \
+              "$CURRENT_ETAG" "$BACKUP_ETAG" \
+              "$VERIFY_ROOT" "$PLAN" "$INTENT" "$AUTHORIZED"
+          fi
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/restore-contract/'
+          const plan = JSON.parse(readFileSync(root + 'read-only-plan.json', 'utf8'))
+          const derived = JSON.parse(readFileSync(root + 'derived-operation.json', 'utf8'))
+          if (!['cas', 'resume'].includes(plan.mode)) throw new Error('invalid restore plan mode')
+          if (typeof plan.currentSha256 !== 'string' || typeof plan.currentEtag !== 'string') {
+            throw new Error('restore plan omitted observed state')
+          }
+          if (plan.operationKey !== derived.operationKey ||
+              plan.manifestCanonicalSha256 !== derived.manifestCanonicalSha256) {
+            throw new Error('verified plan differs from the pre-source derived operation')
+          }
+          for (const [name, value] of Object.entries(derived.objects)) {
+            if (plan[name] !== value) {
+              throw new Error('verified plan object key mismatch: ' + name)
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'mode=' + plan.mode + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_sha256=' + plan.currentSha256 + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_etag=' + plan.currentEtag + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'operation_key=' + plan.operationKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'intent_key=' + plan.intentKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'authorized_manifest_key=' +
+            plan.authorizedManifestKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_registry_payload_key=' +
+            plan.reverseRegistryPayloadKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_registry_artifact_key=' +
+            plan.reverseRegistryArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_website_artifact_key=' +
+            plan.reverseWebsiteArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'target_registry_artifact_key=' +
+            plan.targetRegistryArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'target_website_artifact_key=' +
+            plan.targetWebsiteArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'completion_key=' +
+            plan.completionKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_manifest_key=' +
+            plan.reverseManifestKey + '\n')
+          const self = process.env.OWN_RECORD_STATE === 'full'
+          const intentPath = self
+            ? process.env.RUNNER_TEMP + '/self-proof/intent.json'
+            : root + 'read-only-intent.json'
+          const authorizedPath = self
+            ? process.env.RUNNER_TEMP + '/self-proof/authorized-manifest.json'
+            : root + 'read-only-authorized-manifest.json'
+          appendFileSync(process.env.GITHUB_OUTPUT, 'intent_path=' + intentPath + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'authorized_manifest_path=' +
+            authorizedPath + '\n')
+          appendFileSync(process.env.GITHUB_ENV, 'VERIFY_ROOT=' + process.env.RUNNER_TEMP +
+            '/verified-restore-' + process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT + '\n')
+          NODE
+
+      - name: Verify every present self pre-record independently without writing
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          optional_path() {
+            if test -f "$1"; then
+              printf '%s' "$1"
+            else
+              printf '%s' -
+            fi
+          }
+          pnpm exec tsx scripts/release-contract.ts verify-restore-operation-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-contract/read-only-plan.json" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/intent.json")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/reverse/plugins.json")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/reverse/registry.zip")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/reverse/website.zip")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/target/registry.zip")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/target/website.zip")" \
+            "$(optional_path "$RUNNER_TEMP/self-proof/authorized-manifest.json")" \
+            --allow-missing-for-cas
+
+      - name: Checkout exact website source
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.manifest.outputs.website_source_repository }}
+          ref: ${{ steps.manifest.outputs.website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind website source to current main history
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        working-directory: website
+        env:
+          EXPECTED_REPOSITORY: ${{ needs.guard.outputs.website_driver_repository }}
+          ACTUAL_REPOSITORY: ${{ steps.manifest.outputs.website_source_repository }}
+          EXPECTED_SOURCE_SHA: ${{ steps.manifest.outputs.website_source_sha }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_SHA" refs/remotes/origin/main
+
+      - name: Checkout outgoing website source for reverse-chain dry-run
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.manifest.outputs.from_website_source_repository }}
+          ref: ${{ steps.manifest.outputs.from_website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: from-website-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify outgoing source ancestry
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        working-directory: from-website-source
+        env:
+          EXPECTED_REPOSITORY: ${{ needs.guard.outputs.website_driver_repository }}
+          ACTUAL_REPOSITORY: ${{ steps.manifest.outputs.from_website_source_repository }}
+          EXPECTED_SOURCE_SHA: ${{ steps.manifest.outputs.from_website_source_sha }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_SHA" refs/remotes/origin/main
+
+      - name: Checkout the fixed current-main website deploy driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.guard.outputs.website_driver_repository }}
+          ref: ${{ needs.guard.outputs.website_driver_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website-driver
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install only the fixed website deploy driver
+        working-directory: website-driver
+        env:
+          EXPECTED_DRIVER_SHA: ${{ needs.guard.outputs.website_driver_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_DRIVER_SHA"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run the target prebuilt website dry-run from the fixed driver
+        working-directory: website-driver
+        env:
+          RESTORE_SHA256: ${{ steps.manifest.outputs.restore_sha256 }}
+        run: |
+          set -euo pipefail
+          pnpm cf:deploy:prebuilt:dry -- \
+            --artifact-root "$VERIFY_ROOT/website" \
+            --expected-registry-sha256 "$RESTORE_SHA256"
+
+      - name: Run the reverse prebuilt website dry-run from the fixed driver
+        working-directory: website-driver
+        env:
+          FROM_REGISTRY_SHA256: ${{ steps.manifest.outputs.expected_current_sha256 }}
+        run: |
+          set -euo pipefail
+          pnpm cf:deploy:prebuilt:dry -- \
+            --artifact-root "$VERIFY_ROOT/from-website" \
+            --expected-registry-sha256 "$FROM_REGISTRY_SHA256"
+
+      - name: Emit read-only evidence to the immutable job log
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          MANIFEST_SHA256: ${{ steps.manifest.outputs.manifest_sha256 }}
+          PRODUCER_HEAD_SHA: ${{ steps.manifest.outputs.producer_source_sha }}
+          SOURCE_KIND: ${{ steps.manifest.outputs.source_kind }}
+          OWN_RECORD_STATE: ${{ steps.own_probe.outputs.state }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          console.log(JSON.stringify({
+            kind: 'restore-v2-read-only-preflight',
+            mode: process.env.MODE,
+            manifestSha256: process.env.MANIFEST_SHA256,
+            producerHeadSha: process.env.PRODUCER_HEAD_SHA,
+            sourceKind: process.env.SOURCE_KIND,
+            ownRecordState: process.env.OWN_RECORD_STATE,
+            workflowRunId: process.env.GITHUB_RUN_ID,
+            workflowRunAttempt: process.env.GITHUB_RUN_ATTEMPT
+          }))
+          NODE
+
+  restore:
+    name: Approved verified website deploy and final registry transition
+    needs: guard
+    if: ${{ inputs.dry_run == false }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment:
+      name: plugin-publishing
+    steps:
+      - name: Immediately bind the approved run to current registry main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          APPROVED_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
+          test "$CURRENT_MAIN_SHA" = "$APPROVED_SOURCE_SHA"
+
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.18.0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install publisher dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Materialize and validate the one v2 restore manifest
+        id: manifest
+        env:
+          RESTORE_MANIFEST_JSON: ${{ inputs.restore_manifest_json }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/restore-contract"
+          MANIFEST="$RUNNER_TEMP/restore-contract/restore-manifest.json"
+          test ! -e "$MANIFEST"
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs'
+          const value = process.env.RESTORE_MANIFEST_JSON
+          if (!value) throw new Error('restore_manifest_json is empty')
+          writeFileSync(
+            process.env.RUNNER_TEMP + '/restore-contract/restore-manifest.json',
+            value,
+            { encoding: 'utf8', flag: 'wx', mode: 0o600 }
+          )
+          NODE
+          pnpm exec tsx scripts/release-contract.ts validate-restore-v2 "$MANIFEST"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          import { createHash } from 'node:crypto'
+          const file = process.env.RUNNER_TEMP + '/restore-contract/restore-manifest.json'
+          const bytes = readFileSync(file)
+          const manifest = JSON.parse(bytes)
+          const source = manifest.from.artifactSource
+          const values = {
+            manifest_path: file,
+            manifest_sha256: createHash('sha256').update(bytes).digest('hex'),
+            source_kind: source.kind,
+            parent_operation_key: source.parentOperationKey ?? '',
+            parent_intent_key: source.intentKey ?? '',
+            parent_intent_sha256: source.intentSha256 ?? '',
+            parent_completion_key: source.completionKey ?? '',
+            parent_completion_sha256: source.completionSha256 ?? '',
+            parent_reverse_manifest_key: source.reverseManifestKey ?? '',
+            expected_current_sha256: manifest.from.registry.sha256,
+            expected_current_etag: manifest.from.registry.etag,
+            restore_sha256: manifest.to.registry.sha256,
+            target_source_key: manifest.to.registry.sourceKey,
+            target_source_etag: manifest.to.registry.sourceEtag,
+            website_artifact_id: manifest.to.website.artifactId,
+            website_artifact_name: manifest.to.website.artifactName,
+            website_artifact_sha256: manifest.to.website.artifactSha256,
+            website_run_id: manifest.to.website.runId,
+            website_source_repository: manifest.to.website.sourceRepository,
+            website_source_sha: manifest.to.website.sourceSha,
+            website_dist_sha256: manifest.to.website.distSha256,
+            registry_artifact_id: manifest.to.registry.artifactId,
+            registry_artifact_name: manifest.to.registry.artifactName,
+            registry_artifact_sha256: manifest.to.registry.artifactSha256,
+            registry_run_id: manifest.to.registry.workflowRunId,
+            producer_repository_id: manifest.to.producer.repositoryId,
+            producer_workflow_id: manifest.to.producer.workflowId,
+            producer_source_sha: manifest.to.producer.sourceSha,
+            candidate_artifact_id: manifest.to.candidateManifestArtifact.artifactId,
+            candidate_artifact_name: manifest.to.candidateManifestArtifact.artifactName,
+            candidate_artifact_sha256: manifest.to.candidateManifestArtifact.artifactSha256,
+            completion_artifact_id: manifest.to.completion.artifactId,
+            completion_artifact_name: manifest.to.completion.artifactName,
+            completion_artifact_sha256: manifest.to.completion.artifactSha256,
+            completion_manifest_sha256: manifest.to.completion.manifestSha256,
+            completion_run_id: manifest.to.completion.runId,
+            completion_run_attempt: manifest.to.completion.runAttempt,
+            completion_source_sha: manifest.to.completion.sourceSha,
+            completion_event: manifest.to.completion.event,
+            target_registry_source_artifact_key: manifest.to.artifactSource.registryArtifactKey ?? '',
+            target_website_source_artifact_key: manifest.to.artifactSource.websiteArtifactKey ?? '',
+            from_website_artifact_id: manifest.from.website.artifactId,
+            from_website_artifact_name: manifest.from.website.artifactName,
+            from_website_artifact_sha256: manifest.from.website.artifactSha256,
+            from_website_run_id: manifest.from.website.runId,
+            from_website_source_repository: manifest.from.website.sourceRepository,
+            from_website_source_sha: manifest.from.website.sourceSha,
+            from_website_dist_sha256: manifest.from.website.distSha256,
+            from_registry_artifact_id: manifest.from.registry.artifactId,
+            from_registry_artifact_name: manifest.from.registry.artifactName,
+            from_registry_artifact_sha256: manifest.from.registry.artifactSha256,
+            from_registry_run_id: manifest.from.registry.workflowRunId,
+            from_producer_repository_id: manifest.from.producer.repositoryId,
+            from_producer_workflow_id: manifest.from.producer.workflowId,
+            from_producer_source_sha: manifest.from.producer.sourceSha,
+            from_candidate_artifact_id: manifest.from.candidateManifestArtifact.artifactId,
+            from_candidate_artifact_name: manifest.from.candidateManifestArtifact.artifactName,
+            from_candidate_artifact_sha256: manifest.from.candidateManifestArtifact.artifactSha256,
+            from_completion_artifact_id: manifest.from.completion.artifactId,
+            from_completion_artifact_name: manifest.from.completion.artifactName,
+            from_completion_artifact_sha256: manifest.from.completion.artifactSha256,
+            from_completion_manifest_sha256: manifest.from.completion.manifestSha256,
+            from_completion_run_id: manifest.from.completion.runId,
+            from_completion_run_attempt: manifest.from.completion.runAttempt,
+            from_completion_source_sha: manifest.from.completion.sourceSha,
+            from_completion_event: manifest.from.completion.event,
+            from_registry_source_artifact_key: manifest.from.artifactSource.registryArtifactKey ?? '',
+            from_website_source_artifact_key: manifest.from.artifactSource.websiteArtifactKey ?? ''
+          }
+          for (const [key, value] of Object.entries(values)) {
+            appendFileSync(process.env.GITHUB_OUTPUT, key + '=' + value + '\n')
+          }
+          NODE
+
+      - name: Derive the protected operation prefix before source access
+        id: derived
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          DERIVED="$RUNNER_TEMP/restore-contract/derived-operation.json"
+          test ! -e "$DERIVED"
+          pnpm exec tsx scripts/release-contract.ts derive-restore-operation-v2 \
+            "$MANIFEST" "$DERIVED"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const value = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP + '/restore-contract/derived-operation.json',
+            'utf8'
+          ))
+          if (!/^[0-9a-f]{64}$/.test(value.operationKey ?? '')) {
+            throw new Error('derived operation key is invalid')
+          }
+          const names = [
+            'intentKey',
+            'authorizedManifestKey',
+            'reverseRegistryPayloadKey',
+            'reverseRegistryArtifactKey',
+            'reverseWebsiteArtifactKey',
+            'targetRegistryArtifactKey',
+            'targetWebsiteArtifactKey',
+            'completionKey',
+            'reverseManifestKey'
+          ]
+          appendFileSync(process.env.GITHUB_OUTPUT, 'operation_key=' + value.operationKey + '\n')
+          for (const name of names) {
+            if (typeof value.objects?.[name] !== 'string') {
+              throw new Error('derived operation object key is missing: ' + name)
+            }
+            const output = name.replace(/[A-Z]/g, letter => '_' + letter.toLowerCase())
+            appendFileSync(process.env.GITHUB_OUTPUT, output + '=' + value.objects[name] + '\n')
+          }
+          NODE
+
+      - name: Read live registry and probe this protected operation first
+        id: own_probe
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          INTENT_KEY: ${{ steps.derived.outputs.intent_key }}
+          AUTHORIZED_MANIFEST_KEY: ${{ steps.derived.outputs.authorized_manifest_key }}
+          REVERSE_REGISTRY_PAYLOAD_KEY: ${{ steps.derived.outputs.reverse_registry_payload_key }}
+          REVERSE_REGISTRY_ARTIFACT_KEY: ${{ steps.derived.outputs.reverse_registry_artifact_key }}
+          REVERSE_WEBSITE_ARTIFACT_KEY: ${{ steps.derived.outputs.reverse_website_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.derived.outputs.target_registry_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.derived.outputs.target_website_artifact_key }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 \
+            "$RUNNER_TEMP/live-registry" \
+            "$RUNNER_TEMP/self-proof/reverse" \
+            "$RUNNER_TEMP/self-proof/target" \
+            "$RUNNER_TEMP/self-probe-meta"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            > "$RUNNER_TEMP/live-registry/get.meta.json"
+          read_optional() {
+            key="$1"
+            destination="$2"
+            label="$3"
+            if aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$key" \
+              "$destination" > "$RUNNER_TEMP/self-probe-meta/$label.meta.json" \
+              2> "$RUNNER_TEMP/self-probe-meta/$label.error"; then
+              echo "$label=true" >> "$GITHUB_OUTPUT"
+            elif grep -Eq 'NoSuchKey|Not Found|404' \
+              "$RUNNER_TEMP/self-probe-meta/$label.error"; then
+              rm -f "$destination"
+              echo "$label=false" >> "$GITHUB_OUTPUT"
+            else
+              sed -n '1,80p' "$RUNNER_TEMP/self-probe-meta/$label.error" >&2
+              return 1
+            fi
+          }
+          read_optional "$INTENT_KEY" "$RUNNER_TEMP/self-proof/intent.json" intent_exists
+          read_optional "$AUTHORIZED_MANIFEST_KEY" \
+            "$RUNNER_TEMP/self-proof/authorized-manifest.json" authorized_manifest_exists
+          read_optional "$REVERSE_REGISTRY_PAYLOAD_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/plugins.json" reverse_registry_payload_exists
+          read_optional "$REVERSE_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/registry.zip" reverse_registry_artifact_exists
+          read_optional "$REVERSE_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/reverse/website.zip" reverse_website_artifact_exists
+          read_optional "$TARGET_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/target/registry.zip" target_registry_artifact_exists
+          read_optional "$TARGET_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/self-proof/target/website.zip" target_website_artifact_exists
+          PRESENT_COUNT="$(grep -c '=true$' "$GITHUB_OUTPUT" || true)"
+          case "$PRESENT_COUNT" in
+            0) state=empty ;;
+            7) state=full ;;
+            *) state=partial ;;
+          esac
+          CURRENT_ETAG="$(jq -er '.ETag | strings | select(length > 0)' \
+            "$RUNNER_TEMP/live-registry/get.meta.json")"
+          {
+            echo "state=$state"
+            echo "present_count=$PRESENT_COUNT"
+            echo "current_etag=$CURRENT_ETAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify a complete protected self journal before external source lookup
+        if: ${{ steps.own_probe.outputs.state == 'full' }}
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          VERIFY_ROOT="$RUNNER_TEMP/verified-restore-pre-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          PLAN="$RUNNER_TEMP/restore-contract/pre-plan.json"
+          test ! -e "$VERIFY_ROOT"
+          test ! -e "$PLAN"
+          pnpm exec tsx scripts/release-contract.ts verify-restore-self-v2 \
+            "$MANIFEST" \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            "$RUNNER_TEMP/self-proof" \
+            "$CURRENT_ETAG" "$VERIFY_ROOT" "$PLAN"
+
+      - name: Verify both artifacts belong to one trusted publish run
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          WEBSITE_ARTIFACT_ID: ${{ steps.manifest.outputs.website_artifact_id }}
+          WEBSITE_ARTIFACT_NAME: ${{ steps.manifest.outputs.website_artifact_name }}
+          WEBSITE_ARTIFACT_SHA256: ${{ steps.manifest.outputs.website_artifact_sha256 }}
+          WEBSITE_RUN_ID: ${{ steps.manifest.outputs.website_run_id }}
+          REGISTRY_ARTIFACT_ID: ${{ steps.manifest.outputs.registry_artifact_id }}
+          REGISTRY_ARTIFACT_NAME: ${{ steps.manifest.outputs.registry_artifact_name }}
+          REGISTRY_ARTIFACT_SHA256: ${{ steps.manifest.outputs.registry_artifact_sha256 }}
+          REGISTRY_RUN_ID: ${{ steps.manifest.outputs.registry_run_id }}
+          MANIFEST_PRODUCER_REPOSITORY_ID: ${{ steps.manifest.outputs.producer_repository_id }}
+          MANIFEST_PRODUCER_WORKFLOW_ID: ${{ steps.manifest.outputs.producer_workflow_id }}
+          MANIFEST_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.producer_source_sha }}
+          PREFIX: pre
+          COMPLETION_RUN_ID: ${{ steps.manifest.outputs.completion_run_id }}
+          COMPLETION_RUN_ATTEMPT: ${{ steps.manifest.outputs.completion_run_attempt }}
+          COMPLETION_SOURCE_SHA: ${{ steps.manifest.outputs.completion_source_sha }}
+          COMPLETION_EVENT: ${{ steps.manifest.outputs.completion_event }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          install -d -m 0700 "$RUNNER_TEMP/github-provenance"
+          gh api "repos/$REPOSITORY/actions/artifacts/$WEBSITE_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/$PREFIX-website-artifact.json"
+          gh api "repos/$REPOSITORY/actions/artifacts/$REGISTRY_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/$PREFIX-registry-artifact.json"
+          gh api "repos/$REPOSITORY/actions/runs/$WEBSITE_RUN_ID" \
+            > "$RUNNER_TEMP/github-provenance/$PREFIX-run.json"
+          WORKFLOW_ID="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const value = JSON.parse(readFileSync(
+              process.env.RUNNER_TEMP + '/github-provenance/' +
+                process.env.PREFIX + '-run.json', 'utf8'
+            )).workflow_id
+            if (!Number.isSafeInteger(value)) process.exit(2)
+            process.stdout.write(String(value))
+          ")"
+          gh api "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID" \
+            > "$RUNNER_TEMP/github-provenance/$PREFIX-workflow.json"
+          gh api "repos/$REPOSITORY/actions/runs/$COMPLETION_RUN_ID/attempts/$COMPLETION_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/github-provenance/$PREFIX-completion-run.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/github-provenance/' + process.env.PREFIX + '-'
+          const website = JSON.parse(readFileSync(root + 'website-artifact.json', 'utf8'))
+          const registry = JSON.parse(readFileSync(root + 'registry-artifact.json', 'utf8'))
+          const run = JSON.parse(readFileSync(root + 'run.json', 'utf8'))
+          const workflow = JSON.parse(readFileSync(root + 'workflow.json', 'utf8'))
+          const completion = JSON.parse(readFileSync(root + 'completion-run.json', 'utf8'))
+          const sameId = (actual, expected, label) => {
+            if (String(actual) !== expected) throw new Error(label + ' mismatch')
+          }
+          const bindArtifactRun = (artifact, label) => {
+            const producer = artifact.workflow_run
+            sameId(producer?.id, String(run.id), label + ' run id')
+            sameId(producer?.repository_id, String(run.repository?.id), label + ' repository id')
+            sameId(
+              producer?.head_repository_id,
+              String(run.head_repository?.id),
+              label + ' head repository id'
+            )
+            if (producer?.head_branch !== run.head_branch) {
+              throw new Error(label + ' head branch mismatch')
+            }
+            if (producer?.head_sha !== run.head_sha) {
+              throw new Error(label + ' head SHA mismatch')
+            }
+          }
+          sameId(website.id, process.env.WEBSITE_ARTIFACT_ID, 'website artifact id')
+          sameId(registry.id, process.env.REGISTRY_ARTIFACT_ID, 'registry artifact id')
+          if (website.name !== process.env.WEBSITE_ARTIFACT_NAME ||
+              registry.name !== process.env.REGISTRY_ARTIFACT_NAME) {
+            throw new Error('artifact name mismatch')
+          }
+          if (process.env.WEBSITE_ARTIFACT_ID === process.env.REGISTRY_ARTIFACT_ID) {
+            throw new Error('website and registry artifact ids must differ')
+          }
+          if (website.expired !== false || registry.expired !== false) {
+            throw new Error('restore artifact is expired')
+          }
+          if (website.digest !== 'sha256:' + process.env.WEBSITE_ARTIFACT_SHA256) {
+            throw new Error('website artifact server digest mismatch')
+          }
+          if (registry.digest !== 'sha256:' + process.env.REGISTRY_ARTIFACT_SHA256) {
+            throw new Error('registry artifact server digest mismatch')
+          }
+          if (process.env.WEBSITE_RUN_ID !== process.env.REGISTRY_RUN_ID) {
+            throw new Error('embedded tuple does not identify one publish run')
+          }
+          sameId(run.id, process.env.WEBSITE_RUN_ID, 'publish run id')
+          sameId(run.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'publish repository id')
+          sameId(
+            run.repository?.id,
+            process.env.MANIFEST_PRODUCER_REPOSITORY_ID,
+            'manifest producer repository id'
+          )
+          sameId(run.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'publish head repository id')
+          if (run.repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('publish run repository mismatch')
+          }
+          if (run.head_repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('publish run head repository mismatch')
+          }
+          sameId(workflow.id, String(run.workflow_id), 'producer workflow id')
+          sameId(workflow.id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'manifest workflow id')
+          if (workflow.path !== process.env.TRUSTED_PUBLISH_WORKFLOW_PATH) {
+            throw new Error('unexpected producer workflow endpoint path')
+          }
+          const allowedRunPaths = [
+            workflow.path,
+            workflow.path + '@main',
+            workflow.path + '@refs/heads/main'
+          ]
+          if (!allowedRunPaths.includes(String(run.path ?? ''))) {
+            throw new Error('run path does not cross-check with workflow endpoint')
+          }
+          if (!['push', 'workflow_dispatch'].includes(run.event)) {
+            throw new Error('unexpected producer event')
+          }
+          if (run.head_branch !== 'main') throw new Error('producer head branch is not main')
+          const completedConclusions = new Set([
+            'success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out',
+            'action_required', 'stale', 'startup_failure'
+          ])
+          if (run.status !== 'completed' || !completedConclusions.has(run.conclusion)) {
+            throw new Error('producer run has no completed GitHub conclusion')
+          }
+          if (run.conclusion !== 'success') {
+            sameId(completion.id, process.env.COMPLETION_RUN_ID, 'completion run id')
+            sameId(completion.run_attempt, process.env.COMPLETION_RUN_ATTEMPT, 'completion run attempt')
+            sameId(completion.workflow_id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'completion workflow id')
+            sameId(completion.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'completion repository id')
+            sameId(completion.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'completion head repository id')
+            if (completion.repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_sha !== process.env.COMPLETION_SOURCE_SHA ||
+                completion.head_branch !== 'main' ||
+                completion.event !== 'workflow_dispatch' ||
+                process.env.COMPLETION_EVENT !== 'workflow_dispatch' ||
+                completion.status !== 'completed' || completion.conclusion !== 'success' ||
+                !allowedRunPaths.includes(String(completion.path ?? ''))) {
+              throw new Error('failed producer has no successful attempt-specific completion bridge')
+            }
+          }
+          if (!/^[0-9a-f]{40}$/.test(run.head_sha ?? '')) {
+            throw new Error('producer head SHA is invalid')
+          }
+          if (run.head_sha !== process.env.MANIFEST_PRODUCER_SOURCE_SHA) {
+            throw new Error('producer head SHA differs from the manifest')
+          }
+          bindArtifactRun(website, 'website artifact')
+          bindArtifactRun(registry, 'registry artifact')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'producer_head_sha=' + run.head_sha + '\n')
+          NODE
+
+      - name: Verify the outgoing release artifacts and trusted publish run
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: from_provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          WEBSITE_ARTIFACT_ID: ${{ steps.manifest.outputs.from_website_artifact_id }}
+          WEBSITE_ARTIFACT_NAME: ${{ steps.manifest.outputs.from_website_artifact_name }}
+          WEBSITE_ARTIFACT_SHA256: ${{ steps.manifest.outputs.from_website_artifact_sha256 }}
+          WEBSITE_RUN_ID: ${{ steps.manifest.outputs.from_website_run_id }}
+          REGISTRY_ARTIFACT_ID: ${{ steps.manifest.outputs.from_registry_artifact_id }}
+          REGISTRY_ARTIFACT_NAME: ${{ steps.manifest.outputs.from_registry_artifact_name }}
+          REGISTRY_ARTIFACT_SHA256: ${{ steps.manifest.outputs.from_registry_artifact_sha256 }}
+          REGISTRY_RUN_ID: ${{ steps.manifest.outputs.from_registry_run_id }}
+          MANIFEST_PRODUCER_REPOSITORY_ID: ${{ steps.manifest.outputs.from_producer_repository_id }}
+          MANIFEST_PRODUCER_WORKFLOW_ID: ${{ steps.manifest.outputs.from_producer_workflow_id }}
+          MANIFEST_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.from_producer_source_sha }}
+          COMPLETION_RUN_ID: ${{ steps.manifest.outputs.from_completion_run_id }}
+          COMPLETION_RUN_ATTEMPT: ${{ steps.manifest.outputs.from_completion_run_attempt }}
+          COMPLETION_SOURCE_SHA: ${{ steps.manifest.outputs.from_completion_source_sha }}
+          COMPLETION_EVENT: ${{ steps.manifest.outputs.from_completion_event }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/actions/artifacts/$WEBSITE_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-website-artifact.json"
+          gh api "repos/$REPOSITORY/actions/artifacts/$REGISTRY_ARTIFACT_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-registry-artifact.json"
+          gh api "repos/$REPOSITORY/actions/runs/$WEBSITE_RUN_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-run.json"
+          WORKFLOW_ID="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const value = JSON.parse(readFileSync(
+              process.env.RUNNER_TEMP + '/github-provenance/from-run.json', 'utf8'
+            )).workflow_id
+            if (!Number.isSafeInteger(value)) process.exit(2)
+            process.stdout.write(String(value))
+          ")"
+          gh api "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID" \
+            > "$RUNNER_TEMP/github-provenance/from-workflow.json"
+          gh api "repos/$REPOSITORY/actions/runs/$COMPLETION_RUN_ID/attempts/$COMPLETION_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/github-provenance/from-completion-run.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/github-provenance/from-'
+          const website = JSON.parse(readFileSync(root + 'website-artifact.json', 'utf8'))
+          const registry = JSON.parse(readFileSync(root + 'registry-artifact.json', 'utf8'))
+          const run = JSON.parse(readFileSync(root + 'run.json', 'utf8'))
+          const workflow = JSON.parse(readFileSync(root + 'workflow.json', 'utf8'))
+          const completion = JSON.parse(readFileSync(root + 'completion-run.json', 'utf8'))
+          const sameId = (actual, expected, label) => {
+            if (String(actual) !== expected) throw new Error(label + ' mismatch')
+          }
+          const bind = (artifact, label) => {
+            sameId(artifact.workflow_run?.id, String(run.id), label + ' run id')
+            sameId(artifact.workflow_run?.repository_id, String(run.repository?.id), label + ' repository id')
+            sameId(
+              artifact.workflow_run?.head_repository_id,
+              String(run.head_repository?.id),
+              label + ' head repository id'
+            )
+            if (artifact.workflow_run?.head_branch !== run.head_branch ||
+                artifact.workflow_run?.head_sha !== run.head_sha) {
+              throw new Error(label + ' immutable run identity mismatch')
+            }
+          }
+          sameId(website.id, process.env.WEBSITE_ARTIFACT_ID, 'from website artifact id')
+          sameId(registry.id, process.env.REGISTRY_ARTIFACT_ID, 'from registry artifact id')
+          if (website.name !== process.env.WEBSITE_ARTIFACT_NAME ||
+              registry.name !== process.env.REGISTRY_ARTIFACT_NAME) {
+            throw new Error('from artifact name mismatch')
+          }
+          if (website.expired !== false || registry.expired !== false) {
+            throw new Error('from artifact is expired')
+          }
+          if (website.digest !== 'sha256:' + process.env.WEBSITE_ARTIFACT_SHA256 ||
+              registry.digest !== 'sha256:' + process.env.REGISTRY_ARTIFACT_SHA256) {
+            throw new Error('from artifact server digest mismatch')
+          }
+          if (process.env.WEBSITE_RUN_ID !== process.env.REGISTRY_RUN_ID) {
+            throw new Error('from release artifacts do not share one run')
+          }
+          sameId(run.id, process.env.WEBSITE_RUN_ID, 'from publish run id')
+          sameId(run.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from repository id')
+          sameId(run.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from head repository id')
+          sameId(run.repository?.id, process.env.MANIFEST_PRODUCER_REPOSITORY_ID, 'from manifest repository id')
+          sameId(workflow.id, String(run.workflow_id), 'from workflow id')
+          sameId(workflow.id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'from manifest workflow id')
+          if (run.repository?.full_name !== process.env.REPOSITORY ||
+              run.head_repository?.full_name !== process.env.REPOSITORY) {
+            throw new Error('from producer repository mismatch')
+          }
+          if (workflow.path !== process.env.TRUSTED_PUBLISH_WORKFLOW_PATH) {
+            throw new Error('from workflow endpoint path is not trusted')
+          }
+          const allowedRunPaths = [
+            workflow.path,
+            workflow.path + '@main',
+            workflow.path + '@refs/heads/main'
+          ]
+          if (!allowedRunPaths.includes(String(run.path ?? ''))) {
+            throw new Error('from run path cross-check failed')
+          }
+          const completedConclusions = new Set([
+            'success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out',
+            'action_required', 'stale', 'startup_failure'
+          ])
+          if (!['push', 'workflow_dispatch'].includes(run.event) ||
+              run.head_branch !== 'main' || run.status !== 'completed' ||
+              !completedConclusions.has(run.conclusion)) {
+            throw new Error('from producer run policy mismatch')
+          }
+          if (run.conclusion !== 'success') {
+            sameId(completion.id, process.env.COMPLETION_RUN_ID, 'from completion run id')
+            sameId(completion.run_attempt, process.env.COMPLETION_RUN_ATTEMPT, 'from completion run attempt')
+            sameId(completion.workflow_id, process.env.MANIFEST_PRODUCER_WORKFLOW_ID, 'from completion workflow id')
+            sameId(completion.repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from completion repository id')
+            sameId(completion.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID, 'from completion head repository id')
+            if (completion.repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_repository?.full_name !== process.env.REPOSITORY ||
+                completion.head_sha !== process.env.COMPLETION_SOURCE_SHA ||
+                completion.head_branch !== 'main' ||
+                completion.event !== 'workflow_dispatch' ||
+                process.env.COMPLETION_EVENT !== 'workflow_dispatch' ||
+                completion.status !== 'completed' || completion.conclusion !== 'success' ||
+                !allowedRunPaths.includes(String(completion.path ?? ''))) {
+              throw new Error('failed from producer has no successful attempt-specific completion bridge')
+            }
+          }
+          if (run.head_sha !== process.env.MANIFEST_PRODUCER_SOURCE_SHA) {
+            throw new Error('from producer source SHA mismatch')
+          }
+          bind(website, 'from website artifact')
+          bind(registry, 'from registry artifact')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'producer_head_sha=' + run.head_sha + '\n')
+          NODE
+
+      - name: Download the one raw website ZIP from this repository
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.website_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.website_run_id }}
+          path: ${{ runner.temp }}/website-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download the one raw registry ZIP from this repository
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.registry_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.registry_run_id }}
+          path: ${{ runner.temp }}/registry-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing raw website ZIP for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_website_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_website_run_id }}
+          path: ${{ runner.temp }}/from-website-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing raw registry ZIP for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_registry_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_registry_run_id }}
+          path: ${{ runner.temp }}/from-registry-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download target release completion manifest for protected restore
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.completion_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.completion_run_id }}
+          path: ${{ runner.temp }}/completion-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Download outgoing release completion manifest for protected restore
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.manifest.outputs.from_completion_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.manifest.outputs.from_completion_run_id }}
+          path: ${{ runner.temp }}/from-completion-artifact
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Materialize complete protected GitHub proof roots
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          install -d -m 0700 "$RUNNER_TEMP/source-proof/from" "$RUNNER_TEMP/source-proof/to"
+          fetch_tuple() {
+            side="$1"
+            root="$RUNNER_TEMP/source-proof/$side"
+            candidate_id="$(jq -er ".$side.candidateManifestArtifact.artifactId" "$MANIFEST")"
+            registry_id="$(jq -er ".$side.registry.artifactId" "$MANIFEST")"
+            website_id="$(jq -er ".$side.website.artifactId" "$MANIFEST")"
+            raw_run_id="$(jq -er ".$side.registry.workflowRunId" "$MANIFEST")"
+            workflow_id="$(jq -er ".$side.producer.workflowId" "$MANIFEST")"
+            completion_id="$(jq -er ".$side.completion.artifactId" "$MANIFEST")"
+            completion_run_id="$(jq -er ".$side.completion.runId" "$MANIFEST")"
+            completion_attempt="$(jq -er ".$side.completion.runAttempt" "$MANIFEST")"
+            raw_endpoint="https://api.github.com/repos/$REPOSITORY/actions/runs/$raw_run_id"
+            completion_endpoint="https://api.github.com/repos/$REPOSITORY/actions/runs/$completion_run_id/attempts/$completion_attempt"
+            gh api "repos/$REPOSITORY/actions/artifacts/$candidate_id" > "$root/candidate-artifact.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$registry_id" > "$root/registry-artifact.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$website_id" > "$root/website-artifact.json"
+            gh api "repos/$REPOSITORY/actions/runs/$raw_run_id" > "$root/raw-run.json"
+            jq -n --arg url "$raw_endpoint" '{url: $url}' > "$root/raw-run-endpoint.json"
+            gh api "repos/$REPOSITORY/actions/workflows/$workflow_id" > "$root/raw-workflow.json"
+            gh api "repos/$REPOSITORY/actions/artifacts/$completion_id" > "$root/completion-artifact.json"
+            gh api "repos/$REPOSITORY/actions/runs/$completion_run_id/attempts/$completion_attempt" \
+              > "$root/completion-run.json"
+            jq -n --arg url "$completion_endpoint" '{url: $url}' \
+              > "$root/completion-run-endpoint.json"
+            gh api "repos/$REPOSITORY/actions/workflows/$workflow_id" \
+              > "$root/completion-workflow.json"
+          }
+          fetch_tuple from
+          fetch_tuple to
+          node --input-type=module <<'NODE'
+          import { lstatSync, readdirSync, renameSync } from 'node:fs'
+          import path from 'node:path'
+          function moveOne(side, directory) {
+            const source = path.join(process.env.RUNNER_TEMP, directory)
+            const names = readdirSync(source)
+            if (names.length !== 1) {
+              throw new Error(side + ' completion download must contain exactly one file')
+            }
+            const file = path.join(source, names[0])
+            const stat = lstatSync(file)
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+              throw new Error(side + ' completion manifest is not a regular file')
+            }
+            renameSync(
+              file,
+              path.join(process.env.RUNNER_TEMP, 'source-proof', side, 'release-manifest.json')
+            )
+          }
+          moveOne('from', 'from-completion-artifact')
+          moveOne('to', 'completion-artifact')
+          NODE
+
+      - name: Resolve exactly one downloaded regular ZIP
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: website_zip
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          const root = process.env.RUNNER_TEMP + '/website-artifact'
+          const names = readdirSync(root)
+          if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+            throw new Error('artifact download must contain exactly one ZIP')
+          }
+          const file = path.join(root, names[0])
+          const stat = lstatSync(file)
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error('downloaded website ZIP is not a real regular file')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'path=' + file + '\n')
+          NODE
+
+      - name: Resolve exactly one downloaded regular registry ZIP
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: registry_zip
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          const root = process.env.RUNNER_TEMP + '/registry-artifact'
+          const names = readdirSync(root)
+          if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+            throw new Error('registry artifact download must contain exactly one ZIP')
+          }
+          const file = path.join(root, names[0])
+          const stat = lstatSync(file)
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error('downloaded registry ZIP is not a real regular file')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'path=' + file + '\n')
+          NODE
+
+      - name: Resolve both outgoing raw ZIPs for the reverse chain
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        id: from_zips
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs'
+          import path from 'node:path'
+          function oneZip(directory, label) {
+            const names = readdirSync(directory)
+            if (names.length !== 1 || !names[0].toLowerCase().endsWith('.zip')) {
+              throw new Error(label + ' must contain exactly one ZIP')
+            }
+            const file = path.join(directory, names[0])
+            const stat = lstatSync(file)
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+              throw new Error(label + ' ZIP is not a real regular file')
+            }
+            return file
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'website_path=' + oneZip(
+              process.env.RUNNER_TEMP + '/from-website-artifact',
+              'outgoing website artifact'
+            ) + '\n'
+          )
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'registry_path=' + oneZip(
+              process.env.RUNNER_TEMP + '/from-registry-artifact',
+              'outgoing registry artifact'
+            ) + '\n'
+          )
+          NODE
+
+      - name: Read and bind the initial current and backup objects
+        id: pre_r2
+        if: ${{ steps.own_probe.outputs.state != 'full' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          BACKUP_KEY: ${{ steps.manifest.outputs.target_source_key }}
+          PREFIX: pre
+          OWN_CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 "$RUNNER_TEMP/restore-inputs"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/restore-inputs/$PREFIX-current.json" \
+            > "$RUNNER_TEMP/restore-inputs/$PREFIX-current.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$BACKUP_KEY" \
+            "$RUNNER_TEMP/restore-inputs/$PREFIX-backup.json" \
+            > "$RUNNER_TEMP/restore-inputs/$PREFIX-backup.meta.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          function etag(name) {
+            const file = process.env.RUNNER_TEMP + '/restore-inputs/' +
+              process.env.PREFIX + '-' + name + '.meta.json'
+            const value = JSON.parse(readFileSync(file, 'utf8')).ETag
+            if (typeof value !== 'string' || value.length === 0) {
+              throw new Error(name + ' ETag is missing')
+            }
+            return value
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_etag=' + etag('current') + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'backup_etag=' + etag('backup') + '\n')
+          NODE
+          cmp --silent \
+            "$RUNNER_TEMP/live-registry/plugins.json" \
+            "$RUNNER_TEMP/restore-inputs/pre-current.json"
+          test "$(jq -er '.ETag | strings | select(length > 0)' \
+            "$RUNNER_TEMP/restore-inputs/pre-current.meta.json")" = "$OWN_CURRENT_ETAG"
+
+      - name: Fetch protected direct-parent R2 attestation and referenced ZIPs
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'r2-operation' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PARENT_INTENT_KEY: ${{ steps.manifest.outputs.parent_intent_key }}
+          PARENT_COMPLETION_KEY: ${{ steps.manifest.outputs.parent_completion_key }}
+          PARENT_REVERSE_MANIFEST_KEY: ${{ steps.manifest.outputs.parent_reverse_manifest_key }}
+          FROM_REGISTRY_ARTIFACT_KEY: ${{ steps.manifest.outputs.from_registry_source_artifact_key }}
+          FROM_WEBSITE_ARTIFACT_KEY: ${{ steps.manifest.outputs.from_website_source_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.manifest.outputs.target_registry_source_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.manifest.outputs.target_website_source_artifact_key }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$PARENT_INTENT_KEY"
+          test -n "$PARENT_COMPLETION_KEY"
+          test -n "$PARENT_REVERSE_MANIFEST_KEY"
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 \
+            "$RUNNER_TEMP/source-proof" \
+            "$RUNNER_TEMP/r2-parent-artifacts" \
+            "$RUNNER_TEMP/r2-parent-meta"
+          get_parent() {
+            key="$1"
+            destination="$2"
+            label="$3"
+            aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" --bucket "$R2_BUCKET" --key "$key" \
+              "$destination" > "$RUNNER_TEMP/r2-parent-meta/$label.meta.json"
+          }
+          get_parent "$PARENT_INTENT_KEY" "$RUNNER_TEMP/source-proof/intent.json" parent-intent
+          get_parent "$PARENT_COMPLETION_KEY" "$RUNNER_TEMP/source-proof/completion.json" parent-completion
+          get_parent "$PARENT_REVERSE_MANIFEST_KEY" \
+            "$RUNNER_TEMP/source-proof/reverse-manifest.json" parent-reverse-manifest
+          get_parent "$FROM_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/from-registry.zip" from-registry
+          get_parent "$FROM_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/from-website.zip" from-website
+          get_parent "$TARGET_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/to-registry.zip" to-registry
+          get_parent "$TARGET_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/r2-parent-artifacts/to-website.zip" to-website
+
+      - name: Verify the initial tuple and classify strict two-state plan
+        id: pre_plan
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          SOURCE_KIND: ${{ steps.manifest.outputs.source_kind }}
+          OWN_RECORD_STATE: ${{ steps.own_probe.outputs.state }}
+          WEBSITE_ZIP: ${{ steps.website_zip.outputs.path }}
+          REGISTRY_ZIP: ${{ steps.registry_zip.outputs.path }}
+          FROM_WEBSITE_ZIP: ${{ steps.from_zips.outputs.website_path }}
+          FROM_REGISTRY_ZIP: ${{ steps.from_zips.outputs.registry_path }}
+          CURRENT_ETAG: ${{ steps.own_probe.outputs.current_etag }}
+          BACKUP_ETAG: ${{ steps.pre_r2.outputs.backup_etag }}
+        run: |
+          set -euo pipefail
+          VERIFY_ROOT="$RUNNER_TEMP/verified-restore-pre-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          PLAN="$RUNNER_TEMP/restore-contract/pre-plan.json"
+          INTENT="$RUNNER_TEMP/restore-contract/pre-intent.json"
+          AUTHORIZED="$RUNNER_TEMP/restore-contract/pre-authorized-manifest.json"
+          if test "$OWN_RECORD_STATE" = full; then
+            TARGET_WEBSITE_ZIP="$RUNNER_TEMP/self-proof/target/website.zip"
+            TARGET_REGISTRY_ZIP="$RUNNER_TEMP/self-proof/target/registry.zip"
+            OUTGOING_WEBSITE_ZIP="$RUNNER_TEMP/self-proof/reverse/website.zip"
+            OUTGOING_REGISTRY_ZIP="$RUNNER_TEMP/self-proof/reverse/registry.zip"
+          else
+            if test "$SOURCE_KIND" = github; then
+              TARGET_WEBSITE_ZIP="$WEBSITE_ZIP"
+              TARGET_REGISTRY_ZIP="$REGISTRY_ZIP"
+              OUTGOING_WEBSITE_ZIP="$FROM_WEBSITE_ZIP"
+              OUTGOING_REGISTRY_ZIP="$FROM_REGISTRY_ZIP"
+            else
+              test "$SOURCE_KIND" = r2-operation
+              TARGET_WEBSITE_ZIP="$RUNNER_TEMP/r2-parent-artifacts/to-website.zip"
+              TARGET_REGISTRY_ZIP="$RUNNER_TEMP/r2-parent-artifacts/to-registry.zip"
+              OUTGOING_WEBSITE_ZIP="$RUNNER_TEMP/r2-parent-artifacts/from-website.zip"
+              OUTGOING_REGISTRY_ZIP="$RUNNER_TEMP/r2-parent-artifacts/from-registry.zip"
+            fi
+            EXISTING_INTENT=-
+            if test -f "$RUNNER_TEMP/self-proof/intent.json"; then
+              EXISTING_INTENT="$RUNNER_TEMP/self-proof/intent.json"
+            fi
+            test ! -e "$VERIFY_ROOT"
+            test ! -e "$PLAN"
+            test ! -e "$INTENT"
+            test ! -e "$AUTHORIZED"
+            pnpm exec tsx scripts/release-contract.ts verify-restore-v2 \
+              "$MANIFEST" \
+              "$RUNNER_TEMP/live-registry/plugins.json" \
+              "$RUNNER_TEMP/restore-inputs/pre-backup.json" \
+              "$TARGET_WEBSITE_ZIP" "$TARGET_REGISTRY_ZIP" \
+              "$OUTGOING_WEBSITE_ZIP" "$OUTGOING_REGISTRY_ZIP" \
+              "$RUNNER_TEMP/source-proof" "$EXISTING_INTENT" \
+              "$CURRENT_ETAG" "$BACKUP_ETAG" \
+              "$VERIFY_ROOT" "$PLAN" "$INTENT" "$AUTHORIZED"
+          fi
+          {
+            echo "target_website_zip_path=$TARGET_WEBSITE_ZIP"
+            echo "target_registry_zip_path=$TARGET_REGISTRY_ZIP"
+            echo "from_website_zip_path=$OUTGOING_WEBSITE_ZIP"
+            echo "from_registry_zip_path=$OUTGOING_REGISTRY_ZIP"
+          } >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/restore-contract/'
+          const plan = JSON.parse(readFileSync(root + 'pre-plan.json', 'utf8'))
+          const derived = JSON.parse(readFileSync(root + 'derived-operation.json', 'utf8'))
+          if (!['cas', 'resume'].includes(plan.mode)) throw new Error('invalid restore plan mode')
+          if (typeof plan.currentSha256 !== 'string' || typeof plan.currentEtag !== 'string') {
+            throw new Error('restore plan omitted observed state')
+          }
+          if (plan.operationKey !== derived.operationKey ||
+              plan.manifestCanonicalSha256 !== derived.manifestCanonicalSha256) {
+            throw new Error('verified plan differs from the pre-source derived operation')
+          }
+          for (const [name, value] of Object.entries(derived.objects)) {
+            if (plan[name] !== value) {
+              throw new Error('verified plan object key mismatch: ' + name)
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'mode=' + plan.mode + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_sha256=' + plan.currentSha256 + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'current_etag=' + plan.currentEtag + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'operation_key=' + plan.operationKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'intent_key=' + plan.intentKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'authorized_manifest_key=' +
+            plan.authorizedManifestKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_registry_payload_key=' +
+            plan.reverseRegistryPayloadKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_registry_artifact_key=' +
+            plan.reverseRegistryArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_website_artifact_key=' +
+            plan.reverseWebsiteArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'target_registry_artifact_key=' +
+            plan.targetRegistryArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'target_website_artifact_key=' +
+            plan.targetWebsiteArtifactKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'completion_key=' +
+            plan.completionKey + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'reverse_manifest_key=' +
+            plan.reverseManifestKey + '\n')
+          const self = process.env.OWN_RECORD_STATE === 'full'
+          const intentPath = self
+            ? process.env.RUNNER_TEMP + '/self-proof/intent.json'
+            : root + 'pre-intent.json'
+          const authorizedPath = self
+            ? process.env.RUNNER_TEMP + '/self-proof/authorized-manifest.json'
+            : root + 'pre-authorized-manifest.json'
+          appendFileSync(process.env.GITHUB_OUTPUT, 'intent_path=' + intentPath + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'authorized_manifest_path=' +
+            authorizedPath + '\n')
+          appendFileSync(process.env.GITHUB_ENV, 'VERIFY_ROOT=' + process.env.RUNNER_TEMP +
+            '/verified-restore-pre-' + process.env.GITHUB_RUN_ID + '-' +
+            process.env.GITHUB_RUN_ATTEMPT + '\n')
+          NODE
+
+      - name: Checkout exact website source
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.manifest.outputs.website_source_repository }}
+          ref: ${{ steps.manifest.outputs.website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind website source to current main history
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        working-directory: website
+        env:
+          EXPECTED_REPOSITORY: ${{ needs.guard.outputs.website_driver_repository }}
+          ACTUAL_REPOSITORY: ${{ steps.manifest.outputs.website_source_repository }}
+          EXPECTED_SOURCE_SHA: ${{ steps.manifest.outputs.website_source_sha }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_SHA" refs/remotes/origin/main
+
+      - name: Checkout outgoing website source for reverse-chain verification
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.manifest.outputs.from_website_source_repository }}
+          ref: ${{ steps.manifest.outputs.from_website_source_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: from-website-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind outgoing website source to current main history
+        if: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        working-directory: from-website-source
+        env:
+          EXPECTED_REPOSITORY: ${{ needs.guard.outputs.website_driver_repository }}
+          ACTUAL_REPOSITORY: ${{ steps.manifest.outputs.from_website_source_repository }}
+          EXPECTED_SOURCE_SHA: ${{ steps.manifest.outputs.from_website_source_sha }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_SHA" refs/remotes/origin/main
+
+      - name: Checkout the fixed pre-approval website deploy driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.guard.outputs.website_driver_repository }}
+          ref: ${{ needs.guard.outputs.website_driver_sha }}
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website-driver
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install only the fixed website deploy driver
+        working-directory: website-driver
+        env:
+          EXPECTED_DRIVER_SHA: ${{ needs.guard.outputs.website_driver_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_DRIVER_SHA"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify the target prebuilt website from the fixed driver
+        working-directory: website-driver
+        env:
+          RESTORE_SHA256: ${{ steps.manifest.outputs.restore_sha256 }}
+        run: |
+          set -euo pipefail
+          pnpm cf:deploy:prebuilt:dry -- \
+            --artifact-root "$VERIFY_ROOT/website" \
+            --expected-registry-sha256 "$RESTORE_SHA256"
+
+      - name: Verify the reverse prebuilt website from the fixed driver
+        working-directory: website-driver
+        env:
+          FROM_REGISTRY_SHA256: ${{ steps.manifest.outputs.expected_current_sha256 }}
+        run: |
+          set -euo pipefail
+          pnpm cf:deploy:prebuilt:dry -- \
+            --artifact-root "$VERIFY_ROOT/from-website" \
+            --expected-registry-sha256 "$FROM_REGISTRY_SHA256"
+
+      - name: Re-check registry main immediately before the first live mutation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          APPROVED_SOURCE_SHA: ${{ github.sha }}
+          TO_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.producer_source_sha }}
+          FROM_PRODUCER_SOURCE_SHA: ${{ steps.manifest.outputs.from_producer_source_sha }}
+          HISTORICAL_SOURCE_REQUIRED: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        run: |
+          set -euo pipefail
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
+          test "$CURRENT_MAIN_SHA" = "$APPROVED_SOURCE_SHA"
+          if test "$HISTORICAL_SOURCE_REQUIRED" = true; then
+            git cat-file -e "$TO_PRODUCER_SOURCE_SHA^{commit}"
+            git cat-file -e "$FROM_PRODUCER_SOURCE_SHA^{commit}"
+            git merge-base --is-ancestor "$TO_PRODUCER_SOURCE_SHA" "$APPROVED_SOURCE_SHA"
+            git merge-base --is-ancestor "$FROM_PRODUCER_SOURCE_SHA" "$APPROVED_SOURCE_SHA"
+          fi
+
+      - name: Refresh current website main without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.guard.outputs.website_driver_repository }}
+          ref: main
+          token: ${{ secrets.WEBSITE_READ_TOKEN }}
+          path: website-main-proof
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-check website source ancestry immediately before mutation
+        working-directory: website-main-proof
+        env:
+          FIXED_DRIVER_SHA: ${{ needs.guard.outputs.website_driver_sha }}
+          TO_SOURCE_SHA: ${{ steps.manifest.outputs.website_source_sha }}
+          FROM_SOURCE_SHA: ${{ steps.manifest.outputs.from_website_source_sha }}
+          HISTORICAL_SOURCE_REQUIRED: ${{ steps.own_probe.outputs.state != 'full' && steps.manifest.outputs.source_kind == 'github' }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIXED_DRIVER_SHA"
+          if test "$HISTORICAL_SOURCE_REQUIRED" = true; then
+            git cat-file -e "$TO_SOURCE_SHA^{commit}"
+            git cat-file -e "$FROM_SOURCE_SHA^{commit}"
+            git merge-base --is-ancestor "$TO_SOURCE_SHA" HEAD
+            git merge-base --is-ancestor "$FROM_SOURCE_SHA" HEAD
+          fi
+
+      - name: Warn at the non-atomic partial-state boundary
+        run: |
+          echo "::warning title=NON-ATOMIC RESTORE BOUNDARY::Private R2 intent/reverse-backup, website deploy, and final registry CAS span services. After any failure, rerun this exact manifest; never start an unrelated restore."
+
+      - name: Probe every immutable pre-record independently
+        id: operation_probe
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          INTENT_KEY: ${{ steps.pre_plan.outputs.intent_key }}
+          AUTHORIZED_MANIFEST_KEY: ${{ steps.pre_plan.outputs.authorized_manifest_key }}
+          REVERSE_REGISTRY_PAYLOAD_KEY: ${{ steps.pre_plan.outputs.reverse_registry_payload_key }}
+          REVERSE_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_registry_artifact_key }}
+          REVERSE_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_website_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_registry_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_website_artifact_key }}
+          MODE: ${{ steps.pre_plan.outputs.mode }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 "$RUNNER_TEMP/restore-operation"
+          read_optional() {
+            key="$1"
+            name="$2"
+            destination="$RUNNER_TEMP/restore-operation/existing-$name"
+            if aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" --key "$key" "$destination" \
+              > "$destination.meta.json" 2> "$destination.error"; then
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+            elif grep -Eq 'NoSuchKey|Not Found|404' "$destination.error"; then
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+            else
+              sed -n '1,80p' "$destination.error" >&2
+              return 1
+            fi
+          }
+          read_optional "$INTENT_KEY" intent_exists
+          read_optional "$AUTHORIZED_MANIFEST_KEY" authorized_manifest_exists
+          read_optional "$REVERSE_REGISTRY_PAYLOAD_KEY" reverse_registry_payload_exists
+          read_optional "$REVERSE_REGISTRY_ARTIFACT_KEY" reverse_registry_artifact_exists
+          read_optional "$REVERSE_WEBSITE_ARTIFACT_KEY" reverse_website_artifact_exists
+          read_optional "$TARGET_REGISTRY_ARTIFACT_KEY" target_registry_artifact_exists
+          read_optional "$TARGET_WEBSITE_ARTIFACT_KEY" target_website_artifact_exists
+          if test "$MODE" = resume; then
+            test "$(grep -c '=true' "$GITHUB_OUTPUT")" -eq 7
+          fi
+          existing_or_dash() {
+            name="$1"
+            if grep -q "^$name=true$" "$GITHUB_OUTPUT"; then
+              printf '%s' "$RUNNER_TEMP/restore-operation/existing-$name"
+            else
+              printf '%s' -
+            fi
+          }
+          pnpm exec tsx scripts/release-contract.ts verify-restore-operation-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-contract/pre-plan.json" \
+            "$(existing_or_dash intent_exists)" \
+            "$(existing_or_dash reverse_registry_payload_exists)" \
+            "$(existing_or_dash reverse_registry_artifact_exists)" \
+            "$(existing_or_dash reverse_website_artifact_exists)" \
+            "$(existing_or_dash target_registry_artifact_exists)" \
+            "$(existing_or_dash target_website_artifact_exists)" \
+            "$(existing_or_dash authorized_manifest_exists)" --allow-missing-for-cas
+
+      - name: Resolve only contract-verified pre-record source files
+        id: record_sources
+        env:
+          SOURCE_KIND: ${{ steps.manifest.outputs.source_kind }}
+          OWN_RECORD_STATE: ${{ steps.own_probe.outputs.state }}
+          INTENT_PATH: ${{ steps.pre_plan.outputs.intent_path }}
+          AUTHORIZED_MANIFEST_PATH: ${{ steps.pre_plan.outputs.authorized_manifest_path }}
+          GITHUB_REVERSE_REGISTRY_ZIP: ${{ steps.from_zips.outputs.registry_path }}
+          GITHUB_REVERSE_WEBSITE_ZIP: ${{ steps.from_zips.outputs.website_path }}
+          GITHUB_TARGET_REGISTRY_ZIP: ${{ steps.registry_zip.outputs.path }}
+          GITHUB_TARGET_WEBSITE_ZIP: ${{ steps.website_zip.outputs.path }}
+        run: |
+          set -euo pipefail
+          if test "$OWN_RECORD_STATE" = full; then
+            reverse_registry_zip="$RUNNER_TEMP/self-proof/reverse/registry.zip"
+            reverse_website_zip="$RUNNER_TEMP/self-proof/reverse/website.zip"
+            target_registry_zip="$RUNNER_TEMP/self-proof/target/registry.zip"
+            target_website_zip="$RUNNER_TEMP/self-proof/target/website.zip"
+          elif test "$SOURCE_KIND" = github; then
+            reverse_registry_zip="$GITHUB_REVERSE_REGISTRY_ZIP"
+            reverse_website_zip="$GITHUB_REVERSE_WEBSITE_ZIP"
+            target_registry_zip="$GITHUB_TARGET_REGISTRY_ZIP"
+            target_website_zip="$GITHUB_TARGET_WEBSITE_ZIP"
+          else
+            test "$SOURCE_KIND" = r2-operation
+            reverse_registry_zip="$RUNNER_TEMP/r2-parent-artifacts/from-registry.zip"
+            reverse_website_zip="$RUNNER_TEMP/r2-parent-artifacts/from-website.zip"
+            target_registry_zip="$RUNNER_TEMP/r2-parent-artifacts/to-registry.zip"
+            target_website_zip="$RUNNER_TEMP/r2-parent-artifacts/to-website.zip"
+          fi
+          reverse_registry_payload="$VERIFY_ROOT/from-registry/plugins.json"
+          for file in \
+            "$INTENT_PATH" "$AUTHORIZED_MANIFEST_PATH" \
+            "$reverse_registry_payload" \
+            "$reverse_registry_zip" "$reverse_website_zip" \
+            "$target_registry_zip" "$target_website_zip"; do
+            test -f "$file"
+            test ! -L "$file"
+          done
+          {
+            echo "intent_path=$INTENT_PATH"
+            echo "authorized_manifest_path=$AUTHORIZED_MANIFEST_PATH"
+            echo "reverse_registry_payload_path=$reverse_registry_payload"
+            echo "reverse_registry_zip_path=$reverse_registry_zip"
+            echo "reverse_website_zip_path=$reverse_website_zip"
+            echo "target_registry_zip_path=$target_registry_zip"
+            echo "target_website_zip_path=$target_website_zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Persist canonical immutable restore intent when absent
+        id: intent_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.intent_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          INTENT_KEY: ${{ steps.pre_plan.outputs.intent_key }}
+          INTENT_PATH: ${{ steps.pre_plan.outputs.intent_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$INTENT_KEY" --body "$INTENT_PATH" \
+            --content-type "application/json; charset=utf-8" --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/intent-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/intent-put.error"; then
+            echo "::warning::Intent create returned an error; strict readback will decide whether the immutable object exists correctly."
+          fi
+
+      - name: Persist immutable outgoing reverse backup when absent
+        id: reverse_registry_payload_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.reverse_registry_payload_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          REVERSE_BACKUP_KEY: ${{ steps.pre_plan.outputs.reverse_registry_payload_key }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REVERSE_BACKUP_KEY" \
+            --body "${{ steps.record_sources.outputs.reverse_registry_payload_path }}" \
+            --content-type "application/json; charset=utf-8" --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/reverse-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/reverse-put.error"; then
+            echo "::warning::Reverse payload create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Persist immutable outgoing registry artifact ZIP when absent
+        id: reverse_registry_artifact_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.reverse_registry_artifact_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.reverse_registry_artifact_key }}
+          SOURCE_PATH: ${{ steps.record_sources.outputs.reverse_registry_zip_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type application/zip --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/reverse-registry-artifact-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/reverse-registry-artifact-put.error"; then
+            echo "::warning::Reverse registry ZIP create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Persist immutable outgoing website artifact ZIP when absent
+        id: reverse_website_artifact_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.reverse_website_artifact_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.reverse_website_artifact_key }}
+          SOURCE_PATH: ${{ steps.record_sources.outputs.reverse_website_zip_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type application/zip --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/reverse-website-artifact-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/reverse-website-artifact-put.error"; then
+            echo "::warning::Reverse website ZIP create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Persist immutable target registry artifact ZIP when absent
+        id: target_registry_artifact_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.target_registry_artifact_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.target_registry_artifact_key }}
+          SOURCE_PATH: ${{ steps.record_sources.outputs.target_registry_zip_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type application/zip --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/target-registry-artifact-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/target-registry-artifact-put.error"; then
+            echo "::warning::Target registry ZIP create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Persist immutable target website artifact ZIP when absent
+        id: target_website_artifact_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.target_website_artifact_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.target_website_artifact_key }}
+          SOURCE_PATH: ${{ steps.record_sources.outputs.target_website_zip_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type application/zip --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/target-website-artifact-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/target-website-artifact-put.error"; then
+            echo "::warning::Target website ZIP create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Persist immutable authorized manifest when absent
+        id: authorized_manifest_write
+        if: ${{ steps.pre_plan.outputs.mode == 'cas' && steps.operation_probe.outputs.authorized_manifest_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.authorized_manifest_key }}
+          SOURCE_PATH: ${{ steps.record_sources.outputs.authorized_manifest_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type "application/json; charset=utf-8" --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-operation/authorized-manifest-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-operation/authorized-manifest-put.error"; then
+            echo "::warning::Authorized manifest create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Read back and bind immutable operation records
+        id: operation_readback
+        if: ${{ always() && steps.operation_probe.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          INTENT_KEY: ${{ steps.pre_plan.outputs.intent_key }}
+          REVERSE_REGISTRY_PAYLOAD_KEY: ${{ steps.pre_plan.outputs.reverse_registry_payload_key }}
+          REVERSE_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_registry_artifact_key }}
+          REVERSE_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_website_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_registry_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_website_artifact_key }}
+          AUTHORIZED_MANIFEST_KEY: ${{ steps.pre_plan.outputs.authorized_manifest_key }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$INTENT_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-intent.json" \
+            > "$RUNNER_TEMP/restore-operation/persisted-intent.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REVERSE_REGISTRY_PAYLOAD_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.json" \
+            > "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REVERSE_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.zip" \
+            > "$RUNNER_TEMP/restore-operation/persisted-reverse-registry-artifact.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REVERSE_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-website.zip" \
+            > "$RUNNER_TEMP/restore-operation/persisted-reverse-website-artifact.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$TARGET_REGISTRY_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-registry.zip" \
+            > "$RUNNER_TEMP/restore-operation/persisted-target-registry-artifact.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$TARGET_WEBSITE_ARTIFACT_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-website.zip" \
+            > "$RUNNER_TEMP/restore-operation/persisted-target-website-artifact.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$AUTHORIZED_MANIFEST_KEY" \
+            "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.json" \
+            > "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.meta.json"
+          pnpm exec tsx scripts/release-contract.ts verify-restore-operation-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-contract/pre-plan.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-intent.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const metadata = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP +
+              '/restore-operation/persisted-reverse-registry.meta.json',
+            'utf8'
+          ))
+          if (typeof metadata.ETag !== 'string' || metadata.ETag.length === 0) {
+            throw new Error('persisted reverse registry source ETag is missing')
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'reverse_source_etag=' + metadata.ETag + '\n'
+          )
+          NODE
+
+      # The website is the first user-visible mutation. Operation records above
+      # are private, immutable, and already read back before this step.
+      - name: Deploy only the verified prebuilt website
+        id: website_deploy
+        working-directory: website-driver
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          RESTORE_SHA256: ${{ steps.manifest.outputs.restore_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          pnpm cf:deploy:prebuilt -- \
+            --artifact-root "$VERIFY_ROOT/website" \
+            --expected-registry-sha256 "$RESTORE_SHA256"
+
+      - name: Re-read the live registry after website deploy
+        id: post_r2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/restore-inputs/post-current.json" \
+            > "$RUNNER_TEMP/restore-inputs/post-current.meta.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const metadata = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP + '/restore-inputs/post-current.meta.json',
+            'utf8'
+          ))
+          if (typeof metadata.ETag !== 'string' || metadata.ETag.length === 0) {
+            throw new Error('post-deploy registry ETag is missing')
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'current_etag=' + metadata.ETag + '\n'
+          )
+          NODE
+
+      - name: Reclassify from the complete self journal before registry mutation
+        id: post_plan
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          CURRENT_ETAG: ${{ steps.post_r2.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          SELF_ROOT="$RUNNER_TEMP/persisted-self-proof"
+          VERIFY_ROOT_POST="$RUNNER_TEMP/verified-restore-post-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          PLAN="$RUNNER_TEMP/restore-contract/post-plan.json"
+          test ! -e "$SELF_ROOT"
+          test ! -e "$VERIFY_ROOT_POST"
+          test ! -e "$PLAN"
+          install -d -m 0700 "$SELF_ROOT/reverse" "$SELF_ROOT/target"
+          cp "$RUNNER_TEMP/restore-operation/persisted-intent.json" \
+            "$SELF_ROOT/intent.json"
+          cp "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.json" \
+            "$SELF_ROOT/authorized-manifest.json"
+          cp "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.json" \
+            "$SELF_ROOT/reverse/plugins.json"
+          cp "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.zip" \
+            "$SELF_ROOT/reverse/registry.zip"
+          cp "$RUNNER_TEMP/restore-operation/persisted-reverse-website.zip" \
+            "$SELF_ROOT/reverse/website.zip"
+          cp "$RUNNER_TEMP/restore-operation/persisted-target-registry.zip" \
+            "$SELF_ROOT/target/registry.zip"
+          cp "$RUNNER_TEMP/restore-operation/persisted-target-website.zip" \
+            "$SELF_ROOT/target/website.zip"
+          pnpm exec tsx scripts/release-contract.ts verify-restore-self-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-inputs/post-current.json" \
+            "$SELF_ROOT" "$CURRENT_ETAG" "$VERIFY_ROOT_POST" "$PLAN"
+          cmp --silent "$RUNNER_TEMP/restore-contract/pre-plan.json" "$PLAN"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const plan = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP + '/restore-contract/post-plan.json',
+            'utf8'
+          ))
+          appendFileSync(process.env.GITHUB_OUTPUT, 'mode=' + plan.mode + '\n')
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            'current_etag=' + plan.currentEtag + '\n'
+          )
+          NODE
+
+      # FINAL registry transition. Only the exact pre-state can enter this step;
+      # If-Match closes the race since the post-deploy re-read.
+      - name: CAS exact verified target bytes when still at the pre-state
+        id: restore_write
+        if: ${{ steps.post_plan.outputs.mode == 'cas' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CURRENT_ETAG: ${{ steps.post_plan.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            --body "$RUNNER_TEMP/verified-restore-post-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/registry/plugins.json" \
+            --content-type "application/json; charset=utf-8" \
+            --if-match "$CURRENT_ETAG" \
+            > "$RUNNER_TEMP/restore-inputs/put.meta.json"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const value = JSON.parse(
+            readFileSync(process.env.RUNNER_TEMP + '/restore-inputs/put.meta.json', 'utf8')
+          ).ETag
+          if (typeof value !== 'string' || value.length === 0) {
+            throw new Error('successful R2 PutObject omitted its observed ETag')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'observed_etag=' + value + '\n')
+          NODE
+
+      - name: Select the observed R2 identity for CAS or resume
+        id: transition
+        if: ${{ always() && steps.post_plan.outcome == 'success' && (steps.post_plan.outputs.mode == 'resume' || steps.restore_write.outcome == 'success') }}
+        env:
+          MODE: ${{ steps.post_plan.outputs.mode }}
+          PUT_ETAG: ${{ steps.restore_write.outputs.observed_etag }}
+          RESUME_ETAG: ${{ steps.post_plan.outputs.current_etag }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs'
+          const mode = process.env.MODE
+          const observed = mode === 'cas' ? process.env.PUT_ETAG : process.env.RESUME_ETAG
+          if (!['cas', 'resume'].includes(mode) || !observed) {
+            throw new Error('final transition identity is incomplete')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'mode=' + mode + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'observed_r2_etag=' + observed + '\n')
+          NODE
+
+      - name: Verify the direct restored R2 object before completion records
+        id: direct
+        if: ${{ always() && steps.transition.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          OBSERVED_R2_ETAG: ${{ steps.transition.outputs.observed_r2_etag }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/restore-inputs/restored-r2.json" \
+            > "$RUNNER_TEMP/restore-inputs/restored-r2.meta.json"
+          DIRECT_ETAG="$(node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const value = JSON.parse(readFileSync(
+            process.env.RUNNER_TEMP + '/restore-inputs/restored-r2.meta.json',
+            'utf8'
+          )).ETag
+          if (typeof value !== 'string' || value.length === 0) {
+            throw new Error('direct restored R2 ETag is missing')
+          }
+          process.stdout.write(value)
+          NODE
+          )"
+          test "$DIRECT_ETAG" = "$OBSERVED_R2_ETAG"
+          pnpm exec tsx scripts/release-contract.ts verify-restored-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-inputs/restored-r2.json" \
+            "$DIRECT_ETAG"
+          echo "r2_etag=$DIRECT_ETAG" >> "$GITHUB_OUTPUT"
+
+      - name: Probe both immutable post-transition records independently
+        id: post_probe
+        if: ${{ always() && steps.direct.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          COMPLETION_KEY: ${{ steps.pre_plan.outputs.completion_key }}
+          REVERSE_MANIFEST_KEY: ${{ steps.pre_plan.outputs.reverse_manifest_key }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          install -d -m 0700 "$RUNNER_TEMP/restore-post-records"
+          read_optional() {
+            key="$1"
+            name="$2"
+            destination="$RUNNER_TEMP/restore-post-records/existing-$name.json"
+            if aws s3api get-object --no-cli-pager \
+              --cli-connect-timeout 10 --cli-read-timeout 30 \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" --key "$key" "$destination" \
+              > "$destination.meta.json" 2> "$destination.error"; then
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+              echo "${name}_path=$destination" >> "$GITHUB_OUTPUT"
+            elif grep -Eq 'NoSuchKey|Not Found|404' "$destination.error"; then
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+              echo "${name}_path=-" >> "$GITHUB_OUTPUT"
+            else
+              sed -n '1,80p' "$destination.error" >&2
+              return 1
+            fi
+          }
+          read_optional "$COMPLETION_KEY" completion_exists
+          read_optional "$REVERSE_MANIFEST_KEY" reverse_manifest_exists
+
+      - name: Bind this run to the trusted restore workflow identity
+        id: restore_identity
+        if: ${{ always() && steps.post_probe.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > "$RUNNER_TEMP/restore-post-records/current-run.json"
+          WORKFLOW_ID="$(jq -er '.workflow_id | tostring' \
+            "$RUNNER_TEMP/restore-post-records/current-run.json")"
+          gh api "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID" \
+            > "$RUNNER_TEMP/restore-post-records/current-workflow.json"
+          export WORKFLOW_ID
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const root = process.env.RUNNER_TEMP + '/restore-post-records/'
+          const run = JSON.parse(readFileSync(root + 'current-run.json', 'utf8'))
+          const workflow = JSON.parse(
+            readFileSync(root + 'current-workflow.json', 'utf8')
+          )
+          const sameId = (actual, expected, label) => {
+            if (String(actual ?? '') !== String(expected ?? '')) {
+              throw new Error(label + ' mismatch')
+            }
+          }
+          sameId(run.id, process.env.GITHUB_RUN_ID, 'restore run id')
+          sameId(run.run_attempt, process.env.GITHUB_RUN_ATTEMPT, 'restore run attempt')
+          sameId(run.workflow_id, workflow.id, 'restore workflow id')
+          sameId(workflow.id, process.env.WORKFLOW_ID, 'resolved workflow id')
+          sameId(run.repository?.id, process.env.EXPECTED_REPOSITORY_ID,
+            'restore repository id')
+          sameId(run.head_repository?.id, process.env.EXPECTED_REPOSITORY_ID,
+            'restore head repository id')
+          const trustedPath = '.github/workflows/restore.yml'
+          const allowedRunPaths = [
+            trustedPath,
+            trustedPath + '@main',
+            trustedPath + '@refs/heads/main'
+          ]
+          if (run.repository?.full_name !== process.env.REPOSITORY ||
+              run.head_repository?.full_name !== process.env.REPOSITORY ||
+              run.head_branch !== 'main' ||
+              run.head_sha !== process.env.EXPECTED_SOURCE_SHA ||
+              run.event !== 'workflow_dispatch' ||
+              !allowedRunPaths.includes(String(run.path ?? '')) ||
+              workflow.path !== trustedPath) {
+            throw new Error('current restore workflow provenance mismatch')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            'repository_id=' + process.env.EXPECTED_REPOSITORY_ID + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            'workflow_id=' + process.env.WORKFLOW_ID + '\n')
+          NODE
+
+      - name: Reconstruct the deterministic completion pair
+        id: post_candidates
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          PLAN: ${{ runner.temp }}/restore-contract/post-plan.json
+          OBSERVED_TARGET_ETAG: ${{ steps.direct.outputs.r2_etag }}
+          REVERSE_SOURCE_ETAG: ${{ steps.operation_readback.outputs.reverse_source_etag }}
+          REPOSITORY_ID: ${{ steps.restore_identity.outputs.repository_id }}
+          WORKFLOW_ID: ${{ steps.restore_identity.outputs.workflow_id }}
+          EXISTING_COMPLETION: ${{ steps.post_probe.outputs.completion_exists_path }}
+          EXISTING_REVERSE: ${{ steps.post_probe.outputs.reverse_manifest_exists_path }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          GENERATED_COMPLETION="$RUNNER_TEMP/restore-post-records/generated-completion.json"
+          GENERATED_REVERSE="$RUNNER_TEMP/restore-post-records/generated-reverse-manifest.json"
+          test ! -e "$GENERATED_COMPLETION"
+          test ! -e "$GENERATED_REVERSE"
+          pnpm exec tsx scripts/release-contract.ts complete-restore-v2 \
+            "$MANIFEST" "$PLAN" \
+            "$RUNNER_TEMP/restore-operation/persisted-intent.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.json" \
+            "$RUNNER_TEMP/restore-inputs/restored-r2.json" \
+            "$OBSERVED_TARGET_ETAG" "$REVERSE_SOURCE_ETAG" \
+            "$REPOSITORY_ID" "$WORKFLOW_ID" "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" "$SOURCE_SHA" \
+            "$EXISTING_COMPLETION" "$EXISTING_REVERSE" \
+            "$GENERATED_COMPLETION" "$GENERATED_REVERSE"
+          completion_path="$EXISTING_COMPLETION"
+          reverse_path="$EXISTING_REVERSE"
+          if test "$completion_path" = -; then
+            completion_path="$GENERATED_COMPLETION"
+          fi
+          if test "$reverse_path" = -; then
+            reverse_path="$GENERATED_REVERSE"
+          fi
+          for file in "$completion_path" "$reverse_path"; do
+            test -f "$file"
+            test ! -L "$file"
+          done
+          {
+            echo "completion_path=$completion_path"
+            echo "reverse_manifest_path=$reverse_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create the immutable restore completion when absent
+        id: completion_write
+        if: ${{ steps.post_probe.outputs.completion_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.completion_key }}
+          SOURCE_PATH: ${{ steps.post_candidates.outputs.completion_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type "application/json; charset=utf-8" --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-post-records/completion-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-post-records/completion-put.error"; then
+            echo "::warning::Completion create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Create the immutable reverse restore manifest when absent
+        id: reverse_manifest_write
+        if: ${{ steps.post_probe.outputs.reverse_manifest_exists == 'false' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBJECT_KEY: ${{ steps.pre_plan.outputs.reverse_manifest_key }}
+          SOURCE_PATH: ${{ steps.post_candidates.outputs.reverse_manifest_path }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if ! aws s3api put-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$OBJECT_KEY" --body "$SOURCE_PATH" \
+            --content-type "application/json; charset=utf-8" --if-none-match '*' \
+            > "$RUNNER_TEMP/restore-post-records/reverse-put.meta.json" \
+            2> "$RUNNER_TEMP/restore-post-records/reverse-put.error"; then
+            echo "::warning::Reverse manifest create returned an error; strict readback will decide the result."
+          fi
+
+      - name: Read back and bind the completed restore operation
+        id: completion_readback
+        if: ${{ always() && steps.post_candidates.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          PLAN: ${{ runner.temp }}/restore-contract/post-plan.json
+          COMPLETION_KEY: ${{ steps.pre_plan.outputs.completion_key }}
+          REVERSE_MANIFEST_KEY: ${{ steps.pre_plan.outputs.reverse_manifest_key }}
+          OBSERVED_TARGET_ETAG: ${{ steps.direct.outputs.r2_etag }}
+          REVERSE_SOURCE_ETAG: ${{ steps.operation_readback.outputs.reverse_source_etag }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$COMPLETION_KEY" \
+            "$RUNNER_TEMP/restore-post-records/persisted-completion.json" \
+            > "$RUNNER_TEMP/restore-post-records/persisted-completion.meta.json"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REVERSE_MANIFEST_KEY" \
+            "$RUNNER_TEMP/restore-post-records/persisted-reverse-manifest.json" \
+            > "$RUNNER_TEMP/restore-post-records/persisted-reverse-manifest.meta.json"
+          pnpm exec tsx scripts/release-contract.ts verify-restore-completion-v2 \
+            "$MANIFEST" "$PLAN" \
+            "$RUNNER_TEMP/restore-operation/persisted-intent.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.json" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-reverse-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-registry.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-target-website.zip" \
+            "$RUNNER_TEMP/restore-operation/persisted-authorized-manifest.json" \
+            "$RUNNER_TEMP/restore-post-records/persisted-completion.json" \
+            "$RUNNER_TEMP/restore-post-records/persisted-reverse-manifest.json" \
+            "$RUNNER_TEMP/restore-inputs/restored-r2.json" \
+            "$OBSERVED_TARGET_ETAG" "$REVERSE_SOURCE_ETAG"
+          {
+            echo "completion_sha256=$(pnpm exec tsx scripts/release-contract.ts hash-file \
+              "$RUNNER_TEMP/restore-post-records/persisted-completion.json")"
+            echo "reverse_manifest_sha256=$(pnpm exec tsx scripts/release-contract.ts hash-file \
+              "$RUNNER_TEMP/restore-post-records/persisted-reverse-manifest.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify direct R2 identity and cache-busted public SHA
+        id: live
+        if: ${{ always() && steps.transition.outcome == 'success' && steps.completion_readback.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_READ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_READ_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          MANIFEST: ${{ steps.manifest.outputs.manifest_path }}
+          RESTORE_SHA256: ${{ steps.manifest.outputs.restore_sha256 }}
+          OBSERVED_R2_ETAG: ${{ steps.transition.outputs.observed_r2_etag }}
+        run: |
+          set -euo pipefail
+          R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api get-object --no-cli-pager \
+            --cli-connect-timeout 10 --cli-read-timeout 30 \
+            --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$R2_BUCKET" --key "$REGISTRY_KEY" \
+            "$RUNNER_TEMP/restore-inputs/restored-r2.json" \
+            > "$RUNNER_TEMP/restore-inputs/restored-r2.meta.json"
+          DIRECT_ETAG="$(node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const value = JSON.parse(
+            readFileSync(process.env.RUNNER_TEMP + '/restore-inputs/restored-r2.meta.json', 'utf8')
+          ).ETag
+          if (typeof value !== 'string' || value.length === 0) {
+            throw new Error('direct restored R2 ETag is missing')
+          }
+          process.stdout.write(value)
+          NODE
+          )"
+          test "$DIRECT_ETAG" = "$OBSERVED_R2_ETAG"
+          pnpm exec tsx scripts/release-contract.ts verify-restored-v2 \
+            "$MANIFEST" "$RUNNER_TEMP/restore-inputs/restored-r2.json" "$DIRECT_ETAG"
+
+          PUBLIC_OK=false
+          for ATTEMPT in $(seq 1 12); do
+            ATTEMPT_HEADERS="$RUNNER_TEMP/restore-inputs/public-attempt-$ATTEMPT.headers"
+            ATTEMPT_BODY="$RUNNER_TEMP/restore-inputs/public-attempt-$ATTEMPT.json"
+            CACHE_BUSTER="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ATTEMPT-$(date +%s%N)"
+            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --retry 2 --retry-delay 1 --retry-max-time 45 --retry-connrefused \
+              --dump-header "$ATTEMPT_HEADERS" --output "$ATTEMPT_BODY" \
+              "$PUBLIC_REGISTRY_URL?restore-run=$CACHE_BUSTER" &&
+              ATTEMPT_BODY="$ATTEMPT_BODY" ATTEMPT_HEADERS="$ATTEMPT_HEADERS" \
+                node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { readFileSync } from 'node:fs'
+          const body = readFileSync(process.env.ATTEMPT_BODY)
+          const sha = createHash('sha256').update(body).digest('hex')
+          if (sha !== process.env.RESTORE_SHA256) process.exit(1)
+          const headers = readFileSync(process.env.ATTEMPT_HEADERS, 'utf8')
+          const etags = headers.split(/\r?\n/).filter((line) => /^etag:/i.test(line))
+          const etag = etags.at(-1)?.slice(etags.at(-1).indexOf(':') + 1).trim()
+          if (!etag) process.exit(1)
+          NODE
+            then
+              cp "$ATTEMPT_HEADERS" "$RUNNER_TEMP/restore-inputs/live.headers"
+              cp "$ATTEMPT_BODY" "$RUNNER_TEMP/restore-inputs/live.json"
+              PUBLIC_OK=true
+              echo "public_probe_attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 5
+          done
+          if test "$PUBLIC_OK" != true; then
+            echo "::warning title=PARTIAL STATE::Origin R2 is restored but the public endpoint did not converge after bounded retries. Rerun this exact manifest."
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const live = readFileSync(process.env.RUNNER_TEMP + '/restore-inputs/live.json')
+          const liveSha = createHash('sha256').update(live).digest('hex')
+          if (liveSha !== process.env.RESTORE_SHA256) {
+            throw new Error('cache-busted public registry SHA mismatch')
+          }
+          const direct = JSON.parse(
+            readFileSync(process.env.RUNNER_TEMP + '/restore-inputs/restored-r2.meta.json', 'utf8')
+          ).ETag
+          if (direct !== process.env.OBSERVED_R2_ETAG) {
+            throw new Error('direct R2 ETag differs from the observed transition ETag')
+          }
+          const headers = readFileSync(
+            process.env.RUNNER_TEMP + '/restore-inputs/live.headers',
+            'utf8'
+          )
+          const etags = headers.split(/\r?\n/).filter((line) => /^etag:/i.test(line))
+          const httpEtag = etags.at(-1)?.slice(etags.at(-1).indexOf(':') + 1).trim()
+          if (!httpEtag) throw new Error('public response ETag is missing')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'r2_etag=' + direct + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'http_etag=' + httpEtag + '\n')
+          appendFileSync(process.env.GITHUB_OUTPUT, 'public_sha256=' + liveSha + '\n')
+          NODE
+
+      - name: Write deploy and transition evidence
+        id: execution_evidence
+        if: ${{ always() && steps.operation_probe.outcome == 'success' }}
+        env:
+          MANIFEST_PATH: ${{ steps.manifest.outputs.manifest_path }}
+          MANIFEST_SHA256: ${{ steps.manifest.outputs.manifest_sha256 }}
+          TARGET_WEBSITE_ZIP: ${{ steps.record_sources.outputs.target_website_zip_path }}
+          REVERSE_WEBSITE_ZIP: ${{ steps.record_sources.outputs.reverse_website_zip_path }}
+          OPERATION_KEY: ${{ steps.pre_plan.outputs.operation_key }}
+          INTENT_KEY: ${{ steps.pre_plan.outputs.intent_key }}
+          AUTHORIZED_MANIFEST_KEY: ${{ steps.pre_plan.outputs.authorized_manifest_key }}
+          REVERSE_REGISTRY_PAYLOAD_KEY: ${{ steps.pre_plan.outputs.reverse_registry_payload_key }}
+          REVERSE_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_registry_artifact_key }}
+          REVERSE_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.reverse_website_artifact_key }}
+          TARGET_REGISTRY_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_registry_artifact_key }}
+          TARGET_WEBSITE_ARTIFACT_KEY: ${{ steps.pre_plan.outputs.target_website_artifact_key }}
+          COMPLETION_KEY: ${{ steps.pre_plan.outputs.completion_key }}
+          REVERSE_MANIFEST_KEY: ${{ steps.pre_plan.outputs.reverse_manifest_key }}
+          PRE_MODE: ${{ steps.pre_plan.outputs.mode }}
+          FINAL_MODE: ${{ steps.transition.outputs.mode }}
+          PUT_OBSERVED_ETAG: ${{ steps.restore_write.outputs.observed_etag }}
+          DIRECT_R2_ETAG: ${{ steps.direct.outputs.r2_etag }}
+          LIVE_R2_ETAG: ${{ steps.live.outputs.r2_etag }}
+          TRANSITION_OBSERVED_ETAG: ${{ steps.transition.outputs.observed_r2_etag }}
+          REVERSE_SOURCE_ETAG: ${{ steps.operation_readback.outputs.reverse_source_etag }}
+          LIVE_HTTP_ETAG: ${{ steps.live.outputs.http_etag }}
+          PUBLIC_SHA256: ${{ steps.live.outputs.public_sha256 }}
+          COMPLETION_SHA256: ${{ steps.completion_readback.outputs.completion_sha256 }}
+          REVERSE_MANIFEST_SHA256: ${{ steps.completion_readback.outputs.reverse_manifest_sha256 }}
+          WEBSITE_DEPLOY_OUTCOME: ${{ steps.website_deploy.outcome }}
+          OPERATION_READBACK_OUTCOME: ${{ steps.operation_readback.outcome }}
+          POST_PLAN_OUTCOME: ${{ steps.post_plan.outcome }}
+          RESTORE_WRITE_OUTCOME: ${{ steps.restore_write.outcome }}
+          DIRECT_OUTCOME: ${{ steps.direct.outcome }}
+          COMPLETION_READBACK_OUTCOME: ${{ steps.completion_readback.outcome }}
+          LIVE_OUTCOME: ${{ steps.live.outcome }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/restore-evidence"
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+          const sha = (file) => existsSync(file)
+            ? createHash('sha256').update(readFileSync(file)).digest('hex')
+            : null
+          function readJson(file) {
+            if (!existsSync(file)) return null
+            try {
+              return JSON.parse(readFileSync(file, 'utf8'))
+            } catch {
+              return null
+            }
+          }
+          const manifest = JSON.parse(readFileSync(process.env.MANIFEST_PATH, 'utf8'))
+          const mode = process.env.FINAL_MODE || process.env.PRE_MODE || null
+          const operationKeys = {
+            intentKey: process.env.INTENT_KEY,
+            authorizedManifestKey: process.env.AUTHORIZED_MANIFEST_KEY,
+            reverseRegistryPayloadKey: process.env.REVERSE_REGISTRY_PAYLOAD_KEY,
+            reverseRegistryArtifactKey: process.env.REVERSE_REGISTRY_ARTIFACT_KEY,
+            reverseWebsiteArtifactKey: process.env.REVERSE_WEBSITE_ARTIFACT_KEY,
+            targetRegistryArtifactKey: process.env.TARGET_REGISTRY_ARTIFACT_KEY,
+            targetWebsiteArtifactKey: process.env.TARGET_WEBSITE_ARTIFACT_KEY,
+            completionKey: process.env.COMPLETION_KEY,
+            reverseManifestKey: process.env.REVERSE_MANIFEST_KEY
+          }
+          const completionPath = process.env.RUNNER_TEMP +
+            '/restore-post-records/persisted-completion.json'
+          const reverseManifestPath = process.env.RUNNER_TEMP +
+            '/restore-post-records/persisted-reverse-manifest.json'
+          const reverseExecutable =
+            process.env.COMPLETION_READBACK_OUTCOME === 'success'
+          const evidence = {
+            schemaVersion: 2,
+            kind: 'restore-execution',
+            dryRun: false,
+            mode,
+            preMode: process.env.PRE_MODE || null,
+            workflowRunId: process.env.GITHUB_RUN_ID,
+            workflowRunAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            manifestSha256: process.env.MANIFEST_SHA256,
+            manifest,
+            observed: {
+              targetWebsiteArtifactSha256: sha(process.env.TARGET_WEBSITE_ZIP),
+              reverseWebsiteArtifactSha256: sha(process.env.REVERSE_WEBSITE_ZIP),
+              initialCurrentSha256: sha(process.env.RUNNER_TEMP + '/restore-inputs/pre-current.json'),
+              postDeployCurrentSha256: sha(process.env.RUNNER_TEMP + '/restore-inputs/post-current.json'),
+              restoredDirectSha256: sha(process.env.RUNNER_TEMP + '/restore-inputs/restored-r2.json'),
+              reverseRegistrySha256: sha(
+                process.env.RUNNER_TEMP + '/restore-operation/persisted-reverse-registry.json'
+              ),
+              putResponse: readJson(process.env.RUNNER_TEMP + '/restore-inputs/put.meta.json'),
+              putObservedR2Etag: process.env.PUT_OBSERVED_ETAG || null,
+              transitionObservedR2Etag: process.env.TRANSITION_OBSERVED_ETAG || null,
+              completionDirectR2Etag: process.env.DIRECT_R2_ETAG || null,
+              finalDirectR2Etag: process.env.LIVE_R2_ETAG || null,
+              reverseRegistrySourceEtag: process.env.REVERSE_SOURCE_ETAG || null,
+              finalPublicHttpEtag: process.env.LIVE_HTTP_ETAG || null,
+              finalPublicSha256: process.env.PUBLIC_SHA256 || null
+            },
+            operation: {
+              key: process.env.OPERATION_KEY,
+              ...operationKeys
+            },
+            reverse: {
+              executable: reverseExecutable,
+              requiresNewEnvironmentApproval: true,
+              completionSha256: process.env.COMPLETION_SHA256 || null,
+              manifestSha256: process.env.REVERSE_MANIFEST_SHA256 || null,
+              completion: readJson(completionPath),
+              manifest: readJson(reverseManifestPath)
+            },
+            outcomes: {
+              operationReadback: process.env.OPERATION_READBACK_OUTCOME,
+              websiteDeploy: process.env.WEBSITE_DEPLOY_OUTCOME,
+              postDeployPlan: process.env.POST_PLAN_OUTCOME,
+              registryWrite: process.env.RESTORE_WRITE_OUTCOME,
+              directVerification: process.env.DIRECT_OUTCOME,
+              completionReadback: process.env.COMPLETION_READBACK_OUTCOME,
+              liveVerification: process.env.LIVE_OUTCOME
+            }
+          }
+          const output = process.env.RUNNER_TEMP + '/restore-evidence/restore-execution-' +
+            process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT + '.json'
+          writeFileSync(output, JSON.stringify(evidence, null, 2) + '\n', { mode: 0o600 })
+          NODE
+
+      - name: Retain execution evidence
+        if: ${{ always() && steps.execution_evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ runner.temp }}/restore-evidence/restore-execution-${{ github.run_id }}-${{ github.run_attempt }}.json
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
