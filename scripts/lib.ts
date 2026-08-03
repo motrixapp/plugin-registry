@@ -4,7 +4,7 @@ import {
   ASSETS_BASE_URL,
   REGISTERED_CATEGORIES,
   type RegistryPlugin,
-  RegistryPluginSchema,
+  RegistryPluginAuthoringSchema,
 } from '../schema/registry.ts'
 
 export const PLUGINS_DIR = new URL('../plugins/', import.meta.url).pathname
@@ -20,6 +20,17 @@ export interface EntryProblem {
   message: string
 }
 
+/** Locale-independent UTF-16 code-unit order for ASCII protocol identifiers. */
+export function compareCodeUnitStrings(a: string, b: string): number {
+  if (a === b) return 0
+  const commonLength = Math.min(a.length, b.length)
+  for (let index = 0; index < commonLength; index += 1) {
+    const difference = a.charCodeAt(index) - b.charCodeAt(index)
+    if (difference !== 0) return difference
+  }
+  return a.length - b.length
+}
+
 /**
  * Repo-level policy checks layered on top of the wire schema. The wire
  * schema stays identical across the three vendored copies; these rules
@@ -30,7 +41,7 @@ export function validateEntry(
   raw: unknown
 ): { entry?: RegistryPlugin; problems: EntryProblem[] } {
   const problems: EntryProblem[] = []
-  const parsed = RegistryPluginSchema.safeParse(raw)
+  const parsed = RegistryPluginAuthoringSchema.safeParse(raw)
   if (!parsed.success) {
     return {
       problems: parsed.error.issues.map((issue) => ({
@@ -40,6 +51,13 @@ export function validateEntry(
     }
   }
   const entry = parsed.data
+
+  if (entry.listing.defaultLocale !== 'en-US') {
+    problems.push({
+      file,
+      message: 'publisher policy requires listing.defaultLocale to be "en-US"',
+    })
+  }
 
   if (path.basename(file) !== `${entry.id}.json`) {
     problems.push({
@@ -119,9 +137,15 @@ export async function loadEntries(dir = PLUGINS_DIR): Promise<{
   for (const file of files) {
     let raw: unknown
     try {
-      raw = JSON.parse(await readFile(path.join(dir, file), 'utf8'))
+      const bytes = await readFile(path.join(dir, file))
+      const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      raw = JSON.parse(source)
     } catch (error) {
-      problems.push({ file, message: `invalid JSON: ${String(error)}` })
+      const message =
+        error instanceof TypeError
+          ? `invalid UTF-8: ${error.message}`
+          : `invalid JSON: ${String(error)}`
+      problems.push({ file, message })
       continue
     }
     const result = validateEntry(file, raw)
@@ -140,6 +164,6 @@ export async function loadEntries(dir = PLUGINS_DIR): Promise<{
     entries.push(result.entry)
   }
 
-  entries.sort((a, b) => a.id.localeCompare(b.id))
+  entries.sort((a, b) => compareCodeUnitStrings(a.id, b.id))
   return { entries, problems }
 }

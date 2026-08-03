@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { strToU8, zipSync } from 'fflate'
 import { afterEach, describe, expect, it } from 'vitest'
-import { RegistryPluginSchema } from '../schema/registry.ts'
+import { RegistryPluginAuthoringSchema } from '../schema/registry.ts'
 import {
   buildPackageBlock,
   patchEntry,
@@ -234,8 +234,15 @@ describe('patchEntry', () => {
     dir = await mkdtemp(path.join(tmpdir(), 'plugin-registry-test-'))
     const entry = {
       id,
-      name: { en: 'Test Plugin' },
-      description: { en: 'A test plugin.' },
+      listing: {
+        defaultLocale: 'en-US',
+        localizations: {
+          'en-US': {
+            name: 'Test Plugin',
+            description: 'A test plugin.',
+          },
+        },
+      },
       version: '0.0.1',
       author: { name: 'Motrix Team' },
       origin: 'builtin',
@@ -258,7 +265,15 @@ describe('patchEntry', () => {
     const patched = JSON.parse(await readFile(path.join(d, 'motrix.url-resolver.json'), 'utf8'))
     expect(patched.version).toBe('1.0.0')
     expect(patched.package).toEqual(block().package)
-    expect(patched.name).toEqual({ en: 'Test Plugin' })
+    expect(patched.listing).toEqual({
+      defaultLocale: 'en-US',
+      localizations: {
+        'en-US': {
+          name: 'Test Plugin',
+          description: 'A test plugin.',
+        },
+      },
+    })
     expect(patched.id).toBe('motrix.url-resolver')
   })
 
@@ -286,8 +301,16 @@ describe('patchEntry syncs consent+compat fields from the signed manifest', () =
     dir = await mkdtemp(path.join(tmpdir(), 'plugin-registry-test-'))
     const entry = {
       id,
-      name: { en: 'Filename Template' },
-      description: { en: 'Renames finished downloads.' },
+      listing: {
+        defaultLocale: 'en-US',
+        localizations: {
+          'en-US': {
+            name: 'Filename Template',
+            description: 'Renames finished downloads.',
+          },
+          'zh-CN': { name: '文件名模板' },
+        },
+      },
       version: '1.0.0',
       author: { name: 'Motrix Team' },
       origin: 'builtin',
@@ -337,7 +360,7 @@ describe('patchEntry syncs consent+compat fields from the signed manifest', () =
     const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
     expect(patched.hostPermissions).toEqual([])
     expect(patched.optionalPermissions).toEqual([])
-    expect(RegistryPluginSchema.safeParse(patched).success).toBe(true)
+    expect(RegistryPluginAuthoringSchema.safeParse(patched).success).toBe(true)
   })
 
   it('syncs the engines range from the manifest', async () => {
@@ -356,7 +379,7 @@ describe('patchEntry syncs consent+compat fields from the signed manifest', () =
     expect(patched.engines).toEqual({ motrix: '>=2.0.0 <3.0.0' })
   })
 
-  it('leaves editorial fields (name, description, categories, updatedAt) untouched', async () => {
+  it('preserves the parsed listing by deep equality while manifest fields change', async () => {
     const id = 'motrix.filename-template'
     await writeStaleEntry(id, { hostPermissions: ['*://*/*'] })
     const before = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
@@ -370,8 +393,7 @@ describe('patchEntry syncs consent+compat fields from the signed manifest', () =
     })
     await patchEntry(id, buildPackageBlock(rel, tag, PUB), dir)
     const patched = JSON.parse(await readFile(path.join(dir, `${id}.json`), 'utf8'))
-    expect(patched.name).toEqual(before.name)
-    expect(patched.description).toEqual(before.description)
+    expect(patched.listing).toEqual(before.listing)
     expect(patched.categories).toEqual(before.categories)
     expect(patched.updatedAt).toEqual(before.updatedAt)
   })
