@@ -5,6 +5,10 @@ node_modules/
 # Build output (aggregated registry)
 dist/
 
+# Internal design and implementation documents
+docs/specs/
+docs/plans/
+
 # Test output
 coverage/
 .nyc_output/
