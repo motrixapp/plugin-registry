@@ -1,17 +1,33 @@
 {
-  "$comment": "Shared contract fixture for the registry wire shape (spec 2026-07-10-plugin-registry-api-design.md §8). Mirrored into motrix-turbo and the registry repo; all three consumers must parse this file unchanged. Entries are fictional.",
-  "version": 1,
-  "generatedAt": "2026-07-10T00:00:00.000Z",
+  "$comment": "Shared registry v2 wire fixture. Copy byte-for-byte into motrix-turbo and motrix-website.",
+  "version": 2,
+  "generatedAt": "2026-08-02T00:00:00.000Z",
   "plugins": [
     {
       "id": "example.archive-unpacker",
-      "name": {
-        "en": "Example Archive Unpacker",
-        "zh": "示例压缩包解压器"
-      },
-      "description": {
-        "en": "Unpacks finished archive downloads into a folder next to the file.",
-        "zh": "下载完成后将压缩包解压到同级目录。"
+      "listing": {
+        "defaultLocale": "en-US",
+        "localizations": {
+          "en-US": {
+            "name": "Example Archive Unpacker",
+            "description": "Unpacks finished archive downloads into a folder next to the file.",
+            "features": [
+              "Unpacks zip, tar and 7z archives",
+              "Optional completion notification"
+            ],
+            "keywords": ["archive", "extract"]
+          },
+          "zh-CN": {
+            "name": "示例压缩包解压器",
+            "description": "下载完成后将压缩包解压到同级目录。",
+            "features": ["支持 zip、tar、7z 压缩包", "可选的完成通知"],
+            "keywords": ["压缩包", "解压"]
+          },
+          "ja-JP": {
+            "name": "サンプル・アーカイブ展開",
+            "features": []
+          }
+        }
       },
       "version": "2.1.0",
       "author": {
@@ -35,32 +51,42 @@
       "screenshots": [
         "https://dl.motrix.app/registry/assets/example.archive-unpacker/shot-1.png"
       ],
-      "features": {
-        "en": [
-          "Unpacks zip, tar and 7z archives",
-          "Optional completion notification"
-        ],
-        "zh": ["支持 zip、tar、7z 压缩包", "可选的完成通知"]
-      },
       "updatedAt": "2026-07-08",
       "featured": true
     },
     {
       "id": "example.minimal",
-      "name": { "en": "Example Minimal" },
-      "description": { "en": "The smallest entry the contract accepts." },
+      "listing": {
+        "defaultLocale": "en-US",
+        "localizations": {
+          "en-US": {
+            "name": "Example Minimal",
+            "description": "The smallest default-only listing in the fixture."
+          }
+        }
+      },
       "version": "0.1.0",
       "author": { "name": "Example Dev" },
       "origin": "community",
       "categories": ["integration"],
       "engines": { "motrix": ">=2.0.0" },
+      "package": {
+        "url": "https://github.com/example/minimal/releases/download/v0.1.0/minimal.zip",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size": 1024
+      },
       "updatedAt": "2026-07-01"
     },
     {
       "id": "motrix.url-resolver",
-      "name": { "en": "URL Resolver" },
-      "description": {
-        "en": "Resolves obfuscated download URLs before submission."
+      "listing": {
+        "defaultLocale": "en-US",
+        "localizations": {
+          "en-US": {
+            "name": "URL Resolver",
+            "description": "Resolves obfuscated download URLs before submission."
+          }
+        }
       },
       "version": "1.0.0",
       "author": { "name": "Motrix" },
