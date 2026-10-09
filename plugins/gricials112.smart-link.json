@@ -1,0 +1,98 @@
+{
+  "id": "gricials112.smart-link",
+  "name": {
+    "en": "Motrix Smart Link",
+    "zh": "Motrix 智能链接"
+  },
+  "description": {
+    "en": "Paste a page or a direct link, get the right file. Resolves GitHub repository, release, and file links (plus SourceForge, Google Drive/Docs, and Dropbox shares) into real downloads, with regional mirror acceleration via ghfast.top and automatic SHA-256 verification when publishers provide checksums.",
+    "zh": "粘贴页面或直链，直接得到该下载的文件。解析 GitHub 仓库、发行版与文件链接（另支持 SourceForge、Google Drive/Docs 与 Dropbox 分享），经 ghfast.top 区域镜像加速，并在发布方提供校验值时自动进行 SHA-256 校验。"
+  },
+  "version": "1.0.5",
+  "author": {
+    "name": "gricials112",
+    "url": "https://github.com/gricials112"
+  },
+  "origin": "community",
+  "categories": [
+    "site-resolver"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [
+    "http",
+    "metadata",
+    "fs.task.write"
+  ],
+  "optionalPermissions": [
+    "fs.task.read",
+    "notify"
+  ],
+  "hostPermissions": [
+    "https://github.com/*",
+    "https://github.com/*/*",
+    "https://github.com/*/*/releases",
+    "https://github.com/*/*/releases/latest",
+    "https://github.com/*/*/releases/tag/*",
+    "https://api.github.com/*",
+    "https://ghfast.top/*",
+    "https://*.githubusercontent.com/*",
+    "https://sourceforge.net/*",
+    "https://sourceforge.net/projects/*",
+    "https://sourceforge.net/projects/*/files",
+    "https://sourceforge.net/projects/*/files/latest/download",
+    "https://sourceforge.net/projects/*/files/*/download",
+    "https://sourceforge.net/projects/*/files/*/*/download",
+    "https://sourceforge.net/projects/*/files/*/*/*/download",
+    "https://*.sourceforge.net/*",
+    "https://drive.google.com/*",
+    "https://drive.google.com/file/d/*/*",
+    "https://drive.usercontent.google.com/*",
+    "https://docs.google.com/*",
+    "https://docs.google.com/*/d/*/*",
+    "https://dropbox.com/*",
+    "https://dropbox.com/s/*/*",
+    "https://dropbox.com/scl/fi/*/*",
+    "https://www.dropbox.com/*",
+    "https://www.dropbox.com/s/*/*",
+    "https://www.dropbox.com/scl/fi/*/*",
+    "https://*.dropboxusercontent.com/*",
+    "https://github.com/*/*/releases/download/*/*",
+    "https://github.com/*/*/releases/download/*/*/*",
+    "https://github.com/*/*/archive/*",
+    "https://github.com/*/*/archive/*/*",
+    "https://github.com/*/*/archive/*/*/*",
+    "https://github.com/*/*/blob/*/*",
+    "https://github.com/*/*/blob/*/*/*",
+    "https://github.com/*/*/blob/*/*/*/*",
+    "https://github.com/*/*/blob/*/*/*/*/*",
+    "https://raw.githubusercontent.com/*/*/*/*",
+    "https://raw.githubusercontent.com/*/*/*/*/*",
+    "https://raw.githubusercontent.com/*/*/*/*/*/*"
+  ],
+  "package": {
+    "url": "https://github.com/gricials112/motrix-smart-link/releases/download/v1.0.5/gricials112.smart-link-1.0.5.moext",
+    "sha256": "b56bae3ed108b79ab8df67a6743f689a3e95a0202b219b93e2b685eedb8d942a",
+    "size": 163016
+  },
+  "repository": "https://github.com/gricials112/motrix-smart-link",
+  "features": {
+    "en": [
+      "Resolve GitHub repository, releases, latest, and tagged-release pages into the best installer for your platform",
+      "Instant mirror rewrite for direct release assets, source archives, and raw.githubusercontent files",
+      "Regional cn/global build pairs are picked automatically by your routing signal",
+      "Mirror-first ordering for Simplified Chinese UI or UTC+8 timezones, with official fallback always attached",
+      "Automatic SHA-256 verification against publisher digests and checksum files"
+    ],
+    "zh": [
+      "将 GitHub 仓库、Releases、最新版及指定版本页解析为适配当前平台的安装包",
+      "对发行资产、源码压缩包和仓库文件（raw）直链即时加镜像，无需等待查询",
+      "-cn / -global 成对区域构建按路由信号自动二选一",
+      "简体中文界面或 UTC+8 时区自动镜像优先，官方线路始终作为后备",
+      "依据发布方 digest 或校验文件自动完成 SHA-256 完整性校验"
+    ]
+  },
+  "updatedAt": "2026-08-25",
+  "featured": false
+}
