@@ -10,8 +10,9 @@ https://dl.motrix.app/registry/plugins.json
 ```
 
 有两个对等的消费方读取该文件：[motrix.app/plugins](https://motrix.app/plugins)
-插件目录和 Motrix 应用内的插件市场。publish workflow 完成的那一刻，新插件
-即在两端同时上线——无需等待官网或 App 发版。
+插件目录和 Motrix 应用内的插件市场。合并后会构建经过校验的注册表产物，
+通过 `plugin-publishing` 环境审批后才发布。官网仍由维护者单独构建和手动部署；
+本仓库的工作流只发布注册表数据与资源。
 
 ## 提交插件
 
@@ -23,8 +24,25 @@ https://dl.motrix.app/registry/plugins.json
    Motrix 在解包前校验哈希，不匹配会直接拒绝。
 3. 图标 / 截图可选。文件放在 `assets/<你的插件id>/` 下，并以发布后的
    URL 引用：`https://dl.motrix.app/registry/assets/<你的插件id>/<文件名>`。
-4. 提交 PR。CI 会运行 `pnpm validate`（schema + 策略：id 命名空间、
-   package 地址白名单、已注册的 categories、资产路径前缀）。maintainer
+4. 编辑文案统一放在 `listing` 下。当前 publisher 策略要求
+   `defaultLocale: "en-US"`；default record 必须包含 `name` 与
+   `description`，其他 canonical BCP 47 locale 可以只提供部分字段：
+
+   ```json
+   {
+     "listing": {
+       "defaultLocale": "en-US",
+       "localizations": {
+         "en-US": { "name": "Example", "description": "Example plugin" },
+         "zh-CN": { "name": "示例" },
+         "ja-JP": { "description": "サンプルプラグイン" }
+       }
+     }
+   }
+   ```
+
+5. 提交 PR。CI 会运行 typecheck、test、validate、aggregate 与最终 UTF-8
+   产物大小闸门。maintainer
    review 是信任关卡——registry 会锁定你的包哈希，因此每次发布新版本
    都需要一个 bump 版本号的 PR。
 
@@ -32,8 +50,10 @@ CI 强制执行的规则：
 
 - `id` 为点分隔的小写命名（`author.plugin-name`）；`motrix.*` 命名空间
   保留给 builtin 插件。
-- `name` / `description` 至少提供英文；有条件请补充 `zh`——消费方会
-  自动回退到 `en`。
+- Locale key 必须是无 extension/private-use 的 canonical BCP 47 tag。
+  新增 `ja-JP` 等语言只需改数据，不需改 schema。消费方逐字段按 exact、
+  structural parent、inferred language-script、language、default 回退；显式
+  空 list 表示有意覆盖。
 - `categories` 必须已在 `schema/registry.ts` 中注册（没有合适的先提
   PR 新增 slug）。
 - 权限字段只是安装确认页的**预览**；实际授权始终以包内 manifest 为准，
@@ -41,24 +61,33 @@ CI 强制执行的规则：
 
 ## 发布流程
 
-merge 到 `main` 触发 `.github/workflows/publish.yml`：
-validate → aggregate（生成 `dist/plugins.json`，并盖上 `generatedAt`
-时间戳）→ 连同 `assets/` 一起上传到 `motrix-registry` R2 bucket。
-消费方使用 ETag 缓存该文件并保留最后一份可用副本，因此一次糟糕的发布
-永远不会把插件目录清空。
+合并到 `main` 后，先执行 `check → test → validate → aggregate`，再进入审批。
+工作流将生成的 `plugins.json` 原始字节上传为不可变产物，记录 SHA-256、大小、
+产物 ID 和源码提交。审批后按 ID 下载，校验字节与 v2 schema，不重新构建。
+
+发布前确认 `main` 没有更新，备份 R2 中的旧对象，从已审查的提交上传引用的资源，
+仅当旧对象的 ETag 仍匹配时才替换固定的 `plugins.json`。随后校验 R2 读回和
+公开地址的 SHA-256。官网继续独立手动部署，本流程不需要官网 GitHub 仓库或
+网站部署凭据。
 
 ## 契约与 lockstep
 
-`schema/registry.ts` 中的 wire schema 是 **source of truth**；各消费方
-vendor 与之逐字节一致的 schema 副本和 `schema/registry.fixture.json`。
-改变 wire 结构意味着在同一个 PR 周期内更新所有消费方，且演进只增不删：
-永远不要重命名、更改类型或移除已发布的字段。
+`schema/registry.ts` 中的 tolerant wire schema 与 resolver 是
+**source of truth**。各消费方 vendor wire-equivalent 实现，以及逐字节一致的
+`schema/registry.fixture.json` 与 `schema/registry.conformance.json`。
+Strict publisher-authoring schema 有意更窄，不是 consumer contract。Registry v2
+的 tolerant consumer 也会显式拒绝 v1 plugin-root 字段 `name`、`description` 与 `features`，但仍保留其他未来字段。
+Registry v2 此后仅 additive-only：永远不要重命名、更改类型或移除已发布字段。
 
 ## 开发
 
 ```bash
 pnpm install
-pnpm test        # fixture lockstep + 条目策略测试
+pnpm check       # TypeScript
+pnpm test        # schema、corpus、策略、aggregate、发布产物完整性
 pnpm validate    # CI 对 plugins/ 运行的检查
 pnpm aggregate   # 本地构建 dist/plugins.json
 ```
+
+不要手工编辑或提交 `dist/plugins.json`。公开 URL、root `version: 2`、
+R2 key `plugins.json` 与输出文件名保持不变。

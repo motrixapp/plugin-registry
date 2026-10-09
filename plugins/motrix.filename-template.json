@@ -1,12 +1,29 @@
 {
   "id": "motrix.filename-template",
-  "name": {
-    "en": "Motrix Filename Template",
-    "zh": "Motrix 文件名模板"
-  },
-  "description": {
-    "en": "Renames downloaded files using a template ({{title}}, {{ext}}, {{date}}, {{id}}) before they are finalized.",
-    "zh": "在完成下载前按模板（{{title}}、{{ext}}、{{date}}、{{id}}）重命名文件。"
+  "listing": {
+    "defaultLocale": "en-US",
+    "localizations": {
+      "en-US": {
+        "name": "Motrix Filename Template",
+        "description": "Renames downloaded files using a template ({{title}}, {{ext}}, {{date}}, {{id}}) before they are finalized.",
+        "features": [
+          "Renames finished downloads from a configurable template",
+          "Placeholders: {{title}}, {{ext}}, {{date}}, {{id}}",
+          "Works with HTTP, FTP and BitTorrent downloads",
+          "Applies before the file is finalized on disk"
+        ]
+      },
+      "zh-CN": {
+        "name": "Motrix 文件名模板",
+        "description": "在完成下载前按模板（{{title}}、{{ext}}、{{date}}、{{id}}）重命名文件。",
+        "features": [
+          "按可配置模板重命名已完成的下载",
+          "支持占位符：{{title}}、{{ext}}、{{date}}、{{id}}",
+          "支持 HTTP、FTP 与 BitTorrent 下载",
+          "在文件最终落盘前执行"
+        ]
+      }
+    }
   },
   "version": "1.1.1",
   "author": {
@@ -27,20 +44,6 @@
     "*://*/*"
   ],
   "repository": "https://github.com/motrixapp/builtin-plugins",
-  "features": {
-    "en": [
-      "Renames finished downloads from a configurable template",
-      "Placeholders: {{title}}, {{ext}}, {{date}}, {{id}}",
-      "Works with HTTP, FTP and BitTorrent downloads",
-      "Applies before the file is finalized on disk"
-    ],
-    "zh": [
-      "按可配置模板重命名已完成的下载",
-      "支持占位符：{{title}}、{{ext}}、{{date}}、{{id}}",
-      "支持 HTTP、FTP 与 BitTorrent 下载",
-      "在文件最终落盘前执行"
-    ]
-  },
   "updatedAt": "2026-07-22",
   "package": {
     "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.filename-template%401.1.1/motrix.filename-template-1.1.1.moext",

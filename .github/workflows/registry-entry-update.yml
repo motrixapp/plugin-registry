@@ -67,7 +67,11 @@ jobs:
           PLUGIN_TAG: ${{ steps.in.outputs.tag }}
         run: pnpm entry:from-release "$PLUGIN_ID" "$PLUGIN_TAG"
       - name: Self-gate
-        run: pnpm validate && pnpm test
+        run: |
+          pnpm check
+          pnpm test
+          pnpm validate
+          pnpm aggregate
       # Prefer a GitHub App token for the PR so it TRIGGERS this repo's
       # on:pull_request CI (a GITHUB_TOKEN-created PR does not, by GitHub's
       # anti-recursion rule). Requires the App to also have Pull requests:
