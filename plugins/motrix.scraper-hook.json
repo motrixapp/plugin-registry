@@ -25,7 +25,7 @@
       }
     }
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
     "name": "Motrix Team",
     "url": "https://github.com/motrixapp"
@@ -46,9 +46,10 @@
   "repository": "https://github.com/motrixapp/builtin-plugins",
   "updatedAt": "2026-07-22",
   "package": {
-    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.scraper-hook%401.0.0/motrix.scraper-hook-1.0.0.moext",
-    "sha256": "2b6d1771fa0ccbd21e3a3da1284a589bd8f93d3a2ad6c6813fba6f21d2cfcb25",
-    "size": 2218,
-    "signature": "KjTE1YaLPLKLnsTuLS5aAoI8S7W1D5ziWis1QSvcG/khuimsOKzGeadkc1El0pNhyxWVLzXQR7MYfksUumYVCQ=="
-  }
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.scraper-hook%401.1.0/motrix.scraper-hook-1.1.0.moext",
+    "sha256": "ff7e6e4ff4486afc1178f6029cc159594ef347b82c2109b1f193bd8efe3e68cd",
+    "size": 2449,
+    "signature": "kTQ5j3NOmkVveU8Zh4oxtIAYgde9ZaE0xtXkJI6v0XE4mL+4Ki6IKkAzxYMEZLnLMXGOXOf3fBUP1qjgEMxaDQ=="
+  },
+  "optionalPermissions": []
 }
