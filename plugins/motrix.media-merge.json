@@ -46,5 +46,12 @@
   ],
   "hostPermissions": [],
   "repository": "https://github.com/motrixapp/builtin-plugins",
-  "updatedAt": "2026-10-12"
+  "updatedAt": "2026-10-16",
+  "package": {
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.media-merge%400.1.0/motrix.media-merge-0.1.0.moext",
+    "sha256": "14a67411e9c9ae3afa700e32aff5b3881334e2d665a61d8db0138d17f99861cf",
+    "size": 3340,
+    "signature": "FlGSC01HB3Zsbfp/f/f/0p1+QwAxcui0CKkaLFkTBIEXwjB1KJ+5AkE1A7fGEdr9VOiD7XFcumZME2e1MaxiDw=="
+  },
+  "optionalPermissions": []
 }
