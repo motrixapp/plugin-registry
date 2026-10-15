@@ -1,0 +1,57 @@
+{
+  "id": "motrix.media-merge",
+  "listing": {
+    "defaultLocale": "en-US",
+    "localizations": {
+      "en-US": {
+        "name": "Motrix Media Merge",
+        "description": "Combine separate video and audio files into one MP4 or MKV without re-encoding. An optional official plugin, installed separately.",
+        "features": [
+          "Choose a video, an audio file, and where to save the merged file",
+          "Copy the original tracks into MP4 or MKV without re-encoding",
+          "Open the Operations tab or select two completed single-file downloads",
+          "See progress, cancel a merge, and inspect its activity in plugin logs",
+          "Requires configured FFmpeg and Motrix 2.0.0-beta.48 or later (below 3.0.0) with plugin operations v1; installed separately"
+        ]
+      },
+      "zh-CN": {
+        "name": "Motrix 音视频合并",
+        "description": "将分离的视频和音频合成为一个 MP4 或 MKV 文件，无需重新编码。官方维护，按需安装。",
+        "features": [
+          "选择视频、音频和保存位置，即可手动合并",
+          "直接复制原始轨道，支持 MP4 和 MKV 输出",
+          "从插件的“操作”页进入，或选中两个已完成的单文件下载",
+          "查看合并进度、取消操作，并通过插件日志排查问题",
+          "需要配置 FFmpeg，并使用支持插件操作 v1 的 Motrix 2.0.0-beta.48 及以上版本（低于 3.0.0）；默认不随应用安装"
+        ]
+      }
+    }
+  },
+  "version": "0.1.0",
+  "author": {
+    "name": "Motrix Team",
+    "url": "https://github.com/motrixapp"
+  },
+  "origin": "builtin",
+  "categories": [
+    "post-action"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0-beta.48 <3.0.0"
+  },
+  "permissions": [
+    "ffmpeg",
+    "files.selected.read",
+    "files.selected.write"
+  ],
+  "hostPermissions": [],
+  "repository": "https://github.com/motrixapp/builtin-plugins",
+  "updatedAt": "2026-10-16",
+  "package": {
+    "url": "https://github.com/motrixapp/builtin-plugins/releases/download/motrix.media-merge%400.1.0/motrix.media-merge-0.1.0.moext",
+    "sha256": "14a67411e9c9ae3afa700e32aff5b3881334e2d665a61d8db0138d17f99861cf",
+    "size": 3340,
+    "signature": "FlGSC01HB3Zsbfp/f/f/0p1+QwAxcui0CKkaLFkTBIEXwjB1KJ+5AkE1A7fGEdr9VOiD7XFcumZME2e1MaxiDw=="
+  },
+  "optionalPermissions": []
+}
