@@ -1,0 +1,42 @@
+{
+  "id": "ashkan4472.folder-categories",
+  "listing": {
+    "defaultLocale": "en-US",
+    "localizations": {
+      "en-US": {
+        "name": "Folder Categories",
+        "description": "Sorts finished downloads into IDM-style category folders (Compressed, Documents, Music, Programs, Video). Extension lists and target folders are editable in the plugin settings, and custom categories can be added.",
+        "features": [
+          "Default IDM-style categories with editable extension lists",
+          "Per-category target folder: a name inside the download folder or an absolute path",
+          "Custom categories via Folder=ext,ext entries",
+          "No network, file-read or notification permissions"
+        ]
+      }
+    }
+  },
+  "version": "1.0.0",
+  "author": {
+    "name": "Ashkan4472",
+    "url": "https://github.com/Ashkan4472"
+  },
+  "origin": "community",
+  "categories": [
+    "post-action"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [],
+  "hostPermissions": [
+    "<all_urls>"
+  ],
+  "package": {
+    "url": "https://github.com/Ashkan4472/motrix-folder-categories/releases/download/v1.0.0/ashkan4472.folder-categories-1.0.0.moext",
+    "sha256": "6b1daf929b51c3471263f226aa0a5bfec8fc6717c08a2cdb94bf29a020d53979",
+    "size": 2691
+  },
+  "repository": "https://github.com/Ashkan4472/motrix-folder-categories",
+  "updatedAt": "2026-11-01",
+  "featured": false
+}
