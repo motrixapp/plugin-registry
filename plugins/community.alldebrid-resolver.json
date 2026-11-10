@@ -25,7 +25,7 @@
       }
     }
   },
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "DonTarken",
     "url": "https://github.com/DonTarken"
@@ -47,11 +47,11 @@
     "*://*/*"
   ],
   "package": {
-    "url": "https://github.com/DonTarken/motrix-plugin-alldebrid/releases/download/v1.1.0/community.alldebrid-resolver-1.1.0.moext",
-    "sha256": "620c9a0d13d5366f55866a99c42f3c8078676e5ac7341546152ce656d1712a39",
-    "size": 5115
+    "url": "https://github.com/DonTarken/motrix-plugin-alldebrid/releases/download/v1.2.0/community.alldebrid-resolver-1.2.0.moext",
+    "sha256": "99d8b5c42880c78d8ff3f0356769eaa9d91825e851f6174cc3539ae077d009c9",
+    "size": 6813
   },
   "repository": "https://github.com/DonTarken/motrix-plugin-alldebrid",
-  "updatedAt": "2026-11-07",
+  "updatedAt": "2026-11-10",
   "featured": false
 }
