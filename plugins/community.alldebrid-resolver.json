@@ -48,8 +48,8 @@
   ],
   "package": {
     "url": "https://github.com/DonTarken/motrix-plugin-alldebrid/releases/download/v1.2.0/community.alldebrid-resolver-1.2.0.moext",
-    "sha256": "99d8b5c42880c78d8ff3f0356769eaa9d91825e851f6174cc3539ae077d009c9",
-    "size": 6813
+    "sha256": "14ef0fe353c8d8e18cfff12a46bcc659c9efa9ef2a109a3f6687db1fb1c14a4a",
+    "size": 6850
   },
   "repository": "https://github.com/DonTarken/motrix-plugin-alldebrid",
   "updatedAt": "2026-11-10",
