@@ -1,0 +1,57 @@
+{
+  "id": "community.alldebrid-resolver",
+  "listing": {
+    "defaultLocale": "en-US",
+    "localizations": {
+      "en-US": {
+        "name": "AllDebrid Resolver",
+        "description": "Automatically unlocks and debrids supported download links (1fichier, Rapidgator, etc.) using your AllDebrid premium account.",
+        "features": [
+          "Automatic transparent link debriding",
+          "High-speed multi-connection downloads via Aria2",
+          "Direct API Key configuration",
+          "Account status and expiration notifications"
+        ]
+      },
+      "fr-FR": {
+        "name": "AllDebrid Resolver",
+        "description": "Débride et télécharge automatiquement tous les liens hébergeurs pris en charge (1fichier, Rapidgator, etc.) via votre compte AllDebrid.",
+        "features": [
+          "Débridage automatique et transparent",
+          "Téléchargement multi-connexions ultra-rapide avec Aria2",
+          "Configuration simple avec clé API",
+          "Notifications d'état et d'expiration du compte"
+        ]
+      }
+    }
+  },
+  "version": "1.2.0",
+  "author": {
+    "name": "DonTarken",
+    "url": "https://github.com/DonTarken"
+  },
+  "origin": "community",
+  "categories": [
+    "site-resolver"
+  ],
+  "engines": {
+    "motrix": ">=2.0.0 <3.0.0"
+  },
+  "permissions": [
+    "http",
+    "notify",
+    "storage"
+  ],
+  "optionalPermissions": [],
+  "hostPermissions": [
+    "*://*/*"
+  ],
+  "package": {
+    "url": "https://github.com/DonTarken/motrix-plugin-alldebrid/releases/download/v1.2.0/community.alldebrid-resolver-1.2.0.moext",
+    "sha256": "14ef0fe353c8d8e18cfff12a46bcc659c9efa9ef2a109a3f6687db1fb1c14a4a",
+    "size": 6850
+  },
+  "repository": "https://github.com/DonTarken/motrix-plugin-alldebrid",
+  "updatedAt": "2026-11-10",
+  "featured": false
+}
