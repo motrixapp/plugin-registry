@@ -1,0 +1,56 @@
+{
+  "id": "leonx86.feishu-notifier",
+  "version": "0.5.0",
+  "origin": "community",
+  "categories": [
+    "post-action"
+  ],
+  "permissions": [
+    "http"
+  ],
+  "optionalPermissions": [],
+  "hostPermissions": [
+    "https://open.feishu.cn/*",
+    "https://open.larksuite.com/*"
+  ],
+  "repository": "https://github.com/LeonX86/motrix-feishu-notifier",
+  "updatedAt": "2026-11-22",
+  "featured": false,
+  "listing": {
+    "defaultLocale": "en-US",
+    "localizations": {
+      "en-US": {
+        "name": "Feishu Download Notifier",
+        "description": "Send a Feishu/Lark group bot message when a Motrix download completes.",
+        "features": [
+          "Sends the completed task name, size, completion time and path",
+          "Configurable Feishu custom-bot webhook key",
+          "Configurable UTC offset for the displayed completion time",
+          "Adds the plugin version to every message for hot-update verification"
+        ]
+      },
+      "zh-CN": {
+        "name": "飞书下载通知",
+        "description": "下载完成后通过飞书群自定义机器人发送通知。",
+        "features": [
+          "发送任务名、大小、完成时间和最终路径",
+          "可配置飞书机器人 Webhook key",
+          "可配置完成时间的时区偏移",
+          "消息带插件版本，方便确认热更新版本"
+        ]
+      }
+    }
+  },
+  "author": {
+    "name": "LeonX86",
+    "url": "https://github.com/LeonX86"
+  },
+  "engines": {
+    "motrix": ">=2.4.0 <3.0.0"
+  },
+  "package": {
+    "url": "https://github.com/LeonX86/motrix-feishu-notifier/releases/download/v0.5.0/leonx86.feishu-notifier-0.5.0.moext",
+    "sha256": "242598a4792e52a89b8aae83d15745a5db6cce06437ec5e304ea66908df8f913",
+    "size": 6865
+  }
+}
